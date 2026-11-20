@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+*.log
+*.sqlite*
+*.html
+*.har
+cardmarket-wizard-*.json
+/benchmarks/*.json
+node_modules/

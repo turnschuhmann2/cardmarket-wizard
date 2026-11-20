@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Cardmarket Better Wizard",
+  "version": "0.4.0",
+  "description": "Collects the cheapest offers for every printing on a Cardmarket Wants List and reports how complete the collection is.",
+  "permissions": [
+    "storage",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "https://downloads.s3.cardmarket.com/*",
+    "https://help.cardmarket.com/*",
+    "https://api.scryfall.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.cardmarket.com/*/Magic/Wants/*"
+      ],
+      "js": [
+        "collector.js",
+        "wizard.js",
+        "content.js"
+      ]
+    }
+  ]
+}
