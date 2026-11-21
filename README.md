@@ -44,3 +44,5 @@ Benchmark the optimizer against a saved export:
 ```sh
 node benchmarks/bench.js benchmarks/2026-11-20-1541-by-seller-expansion-groups.json
 ```
+
+See [docs/cardmarket-rate-limits.md](docs/cardmarket-rate-limits.md) (and [AGENTS.md](AGENTS.md)) for empirical Cardmarket/Cloudflare rate-limit findings and collection constraints.
