@@ -153,3 +153,24 @@ test('thorough: reads each expansion group once per seller type', async () => {
   await collectBySellers(plan, site, options);
   assert.deepEqual(asked, [undefined], 'the normal profile reads one page per group');
 });
+
+test('a want missing from the catalogue accepts any identified offer', async () => {
+  const plan = { entries: [want('a', [], { idProduct: 99 })] };
+  const site = fakeSite({ a: [offer('x', 7, 10), offer('y', 8, 12)] }, {});
+  const run = await collectBySellers(plan, site, options);
+  assert.deepEqual(run.results[0].offers.map(o => o.idProduct).sort(), [7, 8]);
+});
+
+test('a specific printing missing from the catalogue accepts only its own id, in both phases', async () => {
+  const plan = { entries: [want('a', [], { idProduct: 99, anyPrinting: false }), want('b', [3])] };
+  const cardOffers = {
+    a: [offer('big', 99, 10), offer('s1', 99, 11), offer('s2', 99, 12), offer('s3', 99, 13), offer('s4', 99, 14), offer('s5', 7, 5)],
+    b: [offer('big', 3, 20), offer('s1', 3, 21), offer('s2', 3, 22), offer('s3', 3, 23), offer('s4', 3, 24)],
+  };
+  // big's Wants List rows: a dearer copy of the wanted printing and another printing of the same card.
+  const inventories = { big: [offer('big', 99, 90), offer('big', 7, 5), offer('big', 3, 20)] };
+  const run = await collectBySellers(plan, fakeSite(cardOffers, inventories), options);
+  const a = run.results.find(result => result.key === 'a');
+  assert.ok(a.offers.every(o => o.idProduct === 99), 'other printings are rejected');
+  assert.ok(a.offers.some(o => o.seller === 'big' && o.priceCents === 90), 'seller-mode Phase 2 matches the wanted id');
+});

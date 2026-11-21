@@ -5,7 +5,7 @@
   'use strict';
 
   const {
-    collect, collectBySellers, createRunner, browserSite, BlockedError, CACHE_MAX_AGE_MS,
+    collect, collectBySellers, createRunner, browserSite, BlockedError, RetryableError, RefusedError, CACHE_MAX_AGE_MS,
   } = globalThis.CardmarketCollector;
   const {
     parseShippingTable, scopeKey, filterByLimits, matchesScope,
@@ -131,6 +131,7 @@
     optimiseJobId: 0,
     optimising: false,
     fetching: false,
+    carting: false,
     controller: null,
     runLog: [],
     currentTables: null,
@@ -281,7 +282,7 @@
     }
     const fromIds = [...locations].map(name => COUNTRY_ID_BY_NAME[name]).filter(Boolean);
     if (!fromIds.includes(state.shipTo)) fromIds.push(state.shipTo);
-    const { tables, error } = await chrome.runtime.sendMessage({
+    const { tables, failed = [], error } = await chrome.runtime.sendMessage({
       type: 'shipping-multi',
       fromList: fromIds,
       to: state.shipTo,
@@ -291,8 +292,13 @@
     for (const [name, methods] of Object.entries(tables || {})) {
       if (Array.isArray(methods)) byLocation[name] = parseShippingTable(methods);
     }
-    const defaultTable = byLocation[defaultCountry] || byLocation.Germany || Object.values(byLocation)[0] || [];
-    return { default: defaultTable, byLocation };
+    // An empty table keeps a failed country from silently being priced with the domestic one.
+    for (const country of failed) byLocation[country] = [];
+    const defaultTable = byLocation[defaultCountry];
+    if (failed.includes(defaultCountry) || !defaultTable?.length) {
+      throw new Error(`Shipping tables: no shipping rates available for ${defaultCountry}.`);
+    }
+    return { default: defaultTable, byLocation, failed };
   }
 
   // ---- Offer Query Cache (8h TTL for automatic reuse) ----
@@ -481,17 +487,26 @@
   }
 
   // ---- Progress & Busy Controls ----
-  function setBusy(running, mode = 'fetch') {
-    state.fetching = running && mode === 'fetch';
+  function syncBusyUI() {
+    const working = state.fetching || state.carting;
     const computeBtn = $('btnCompute');
-    const spinner = computeBtn.querySelector('.btn-spinner');
-    computeBtn.disabled = running;
-    $('btnRefetch').disabled = running;
-    $('btnStop').hidden = !(running && mode === 'fetch');
-    spinner.hidden = !running;
-    $('btnComputeLabel').textContent = !running ? 'Compute Basket' : mode === 'fetch' ? 'Fetching offers…' : 'Optimising…';
-    if (running && mode === 'fetch') state.controller = new AbortController();
-    else if (!running) state.controller = null;
+    computeBtn.disabled = working;
+    $('btnRefetch').disabled = working;
+    $('btnOpenRun').disabled = working;
+    $('importFile').disabled = working;
+    $('btnBuy').disabled = working || state.optimising;
+    $('btnStop').hidden = !(working && state.controller);
+    computeBtn.querySelector('.btn-spinner').hidden = !(working || state.optimising);
+    $('btnComputeLabel').textContent = state.fetching ? 'Fetching offers…'
+      : state.carting ? 'Adding to cart…'
+        : state.optimising ? 'Optimising…' : 'Compute Basket';
+  }
+
+  // Recompute triggers must not overlap a fetch or cart run.
+  function workInProgress() {
+    if (!state.fetching && !state.carting) return false;
+    toast('Wait for the current fetch or cart run to finish first.', 'error');
+    return true;
   }
 
   function showProgress(title, meta = '', percent = null, sub = '') {
@@ -507,12 +522,15 @@
   }
 
   // ---- Verification Pause Handling ----
+  let activePause = null;
   function waitForUser(message, attempt) {
+    // Concurrent callers share one prompt so they cannot overwrite each other's buttons.
+    if (activePause) return activePause;
     const automatic = attempt === 1;
     const until = Date.now() + 10000;
     record({ type: automatic ? 'auto-wait' : 'asked-user', message, attempt });
     $('pauseBanner').hidden = false;
-    return new Promise((resolve, reject) => {
+    activePause = new Promise((resolve, reject) => {
       let timer = null;
       const signal = state.controller?.signal;
       const abort = () => finish(false);
@@ -536,7 +554,8 @@
       $('btnPauseStop').onclick = () => { state.controller?.abort(); finish(false); };
       if (signal?.aborted) abort();
       else signal?.addEventListener('abort', abort, { once: true });
-    });
+    }).finally(() => { activePause = null; });
+    return activePause;
   }
 
   // ---- Cache Alert Modal ----
@@ -606,11 +625,13 @@
     }).join('') + '<button type="button" id="btnClearAllLimits" class="btn btn-link btn-xs">Clear all limits</button>';
 
     bar.querySelectorAll('[data-rm-limit]').forEach(btn => btn.addEventListener('click', async () => {
+      if (workInProgress()) return;
       state.activeLimits.splice(Number(btn.dataset.rmLimit), 1);
       await persistLimitsAndCuts();
       await computeBasketFromCollection();
     }));
     $('btnClearAllLimits')?.addEventListener('click', async () => {
+      if (workInProgress()) return;
       state.activeLimits = [];
       await persistLimitsAndCuts();
       await computeBasketFromCollection();
@@ -736,7 +757,7 @@
           renderLimitsSkeleton(5, partial);
         }
       });
-      if (myJob !== state.limitEstimateJobId) return;
+      if (myJob !== state.limitEstimateJobId || res.cancelled) return;
       state.limitOptions = res.options || [];
       state.limitBaselineCents = res.baselineCents;
       renderLimitsTable();
@@ -747,6 +768,7 @@
   }
 
   async function applySelectedLimit() {
+    if (workInProgress()) return;
     const choice = document.querySelector('input[name="bwLimit"]:checked')?.value;
     let centsVal = null;
     if (choice === 'none') {
@@ -806,6 +828,7 @@
       $('btnCopyLeftPlain').addEventListener('click', () => copyEntries(leftOutEntries(), 'plain', 'left-out items'));
       $('btnCopyLeftArchidekt')?.addEventListener('click', () => copyEntries(leftOutEntries(), 'archidekt', 'left-out Magic cards'));
       $('btnPutAllBack').addEventListener('click', async () => {
+        if (workInProgress()) return;
         state.manualCuts = [];
         state.activeLimits = [];
         await persistLimitsAndCuts();
@@ -859,6 +882,7 @@
         </div>
       </details>`;
     $('btnLeaveOutTicked').addEventListener('click', async () => {
+      if (workInProgress()) return;
       const chosen = [...body.querySelectorAll('[data-cut-key]:checked')].map(b => b.dataset.cutKey);
       if (!chosen.length) return;
       state.manualCuts = [...new Set([...state.manualCuts, ...chosen])];
@@ -1013,6 +1037,10 @@
     renderCoverageTab();
   }
 
+  const warningBanner = (title, items) => (Array.isArray(items) && items.length
+    ? `<div class="alert-banner alert-warn" style="margin-bottom:12px"><div><strong>${esc(title)}</strong> ${items.map(esc).join('; ')}</div></div>`
+    : '');
+
   function renderCoverageTab() {
     const col = state.collection;
     if (!col) return;
@@ -1021,11 +1049,11 @@
     const counts = {};
     for (const r of col.results) counts[r.verdict] = (counts[r.verdict] || 0) + 1;
     $('coverageMeta').innerHTML = `<p class="card-hint">
-      Fetched <strong>${new Date(col.stats.finishedAt).toLocaleString()}</strong> (${fmtAge(col.stats.finishedAt)}):
-      ${col.stats.requests} requests (${col.stats.cachedQueries} cached) in ${mins} min ·
-      ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(', ')}.
+      Fetched <strong>${esc(new Date(col.stats.finishedAt).toLocaleString())}</strong> (${fmtAge(col.stats.finishedAt)}):
+      ${Number(col.stats.requests) || 0} requests (${Number(col.stats.cachedQueries) || 0} cached) in ${mins} min ·
+      ${Object.entries(counts).map(([k, v]) => `${v} ${esc(k)}`).join(', ')}.
       ${col.blocked ? `<strong style="color:var(--rose)">Stopped early: ${esc(col.blocked)}</strong>` : ''}
-    </p>`;
+    </p>${warningBanner('Warnings:', col.warnings)}`;
     $('coverageTables').innerHTML = `
       <table class="data-table">
         <thead><tr><th>Item</th><th>Source</th><th>Status</th><th class="num">Target</th><th class="num">Offers</th></tr></thead>
@@ -1048,26 +1076,35 @@
     if (!col) return;
     const myJob = ++state.optimiseJobId;
     state.optimising = true;
-    setBusy(true, 'optimise');
+    syncBusyUI();
     $('emptyState').hidden = true;
     $('resultsArea').hidden = false;
-    $('topNotice').innerHTML = '';
 
+    const notices = [];
     const collected = col.results.filter(r => !['blocked', 'incomplete'].includes(r.verdict)).length;
     if (collected < col.results.length) {
-      $('topNotice').innerHTML = `<div class="alert-banner alert-warn">
+      notices.push(`<div class="alert-banner alert-warn">
         <div><strong>Incomplete fetch:</strong> only ${collected} of ${col.results.length} items were collected. Click <em>Refetch offers</em> to complete the rest.</div>
-      </div>`;
+      </div>`);
     }
+    notices.push(warningBanner('Warnings:', col.warnings));
+    $('topNotice').innerHTML = notices.join('');
 
     try {
       showProgress('Loading shipping tables…', '', 12, 'Fetching per-country Cardmarket postal rates');
-      state.currentTables = await loadShippingTablesFor(col);
+      const { failed: shippingFailed, ...tables } = await loadShippingTablesFor(col);
+      if (myJob !== state.optimiseJobId) return;
+      state.currentTables = tables;
+      if (shippingFailed.length) {
+        notices.push(warningBanner('Shipping rates could not be loaded for:', [`${shippingFailed.join(', ')}. Sellers from there may be missing or mispriced; recompute to retry.`]));
+        $('topNotice').innerHTML = notices.join('');
+      }
 
       const sig = col.selectionSig || selectionSignature();
       const route = `${state.shipTo}:${state.activeLimits.map(r => `${scopeKey(r)}=${r.cents}`).sort().join(',')}:${[...state.manualCuts].sort().join(',')}`;
       const bestKey = `bwBest:${sig}:${route}`;
       const { [bestKey]: previous } = await chrome.storage.local.get(bestKey);
+      if (myJob !== state.optimiseJobId) return;
 
       showProgress('Optimising basket across sellers…', 'Running multi-strategy search in background worker', 25);
 
@@ -1103,15 +1140,17 @@
         }
       });
 
-      if (myJob !== state.optimiseJobId) return;
+      if (myJob !== state.optimiseJobId || result.cancelled) return;
       state.basket = result.basket;
       state.cuts = result.cuts || [];
       state.optimising = false;
+      syncBusyUI();
 
       if (Number.isFinite(state.basket.totalCents)) {
         await chrome.storage.local.set({
           [bestKey]: { totalCents: state.basket.totalCents, picks: state.basket.picks },
         });
+        if (myJob !== state.optimiseJobId) return;
       }
 
       const savedVsQuick = result.quickCents - state.basket.totalCents;
@@ -1135,7 +1174,7 @@
     } finally {
       if (myJob === state.optimiseJobId) {
         state.optimising = false;
-        setBusy(false);
+        syncBusyUI();
       }
     }
   }
@@ -1149,7 +1188,16 @@
       return;
     }
 
-    setBusy(true, 'fetch');
+    if (state.fetching || state.carting) return;
+    state.fetching = true;
+    const controller = new AbortController();
+    state.controller = controller;
+    syncBusyUI();
+    const release = () => {
+      if (state.controller === controller) state.controller = null;
+      state.fetching = false;
+      syncBusyUI();
+    };
     state.runLog = [];
     const sellerCountries = getSellerCountries();
     const sig = selectionSignature();
@@ -1208,7 +1256,8 @@
       }
 
       // 3. Preload shipping tables for evaluation during seller batching.
-      const evalTables = await loadShippingTablesFor({ results: [] });
+      let evalTables = await loadShippingTablesFor({ results: [] });
+      const triedLocations = new Set(Object.keys(evalTables.byLocation));
       const trackedOnly = Object.keys(state.trackedSellers);
       const cache = await offerCache(forceFresh);
 
@@ -1217,7 +1266,7 @@
       const common = {
         sellerCountries,
         intervalMs: state.interval,
-        signal: state.controller.signal,
+        signal: controller.signal,
         cache,
         cacheMaxAgeMs: forceFresh ? 0 : CACHE_MAX_AGE_MS,
         waitForUser,
@@ -1243,7 +1292,27 @@
 
       const planObj = { entries: combinedEntries };
       const evaluate = async results => {
-        const res = await runWorker({ type: 'quick-cost', results, tables: evalTables, trackedOnly });
+        // Sellers found since the last batch may ship from countries we have no table for yet.
+        const unseen = new Set();
+        for (const r of results) {
+          for (const o of r.offers || []) {
+            if (o.location && COUNTRY_ID_BY_NAME[o.location] && !triedLocations.has(o.location)) unseen.add(o.location);
+          }
+        }
+        let tablesForBatch = evalTables;
+        if (unseen.size) {
+          try {
+            evalTables = await loadShippingTablesFor({ results });
+            tablesForBatch = evalTables;
+            for (const location of unseen) triedLocations.add(location);
+          } catch (error) {
+            record({ type: 'error', message: error.message });
+            // Price this batch's unseen locations as unavailable rather than domestic; later batches retry.
+            tablesForBatch = { ...evalTables, byLocation: { ...evalTables.byLocation } };
+            for (const location of unseen) tablesForBatch.byLocation[location] = [];
+          }
+        }
+        const res = await runWorker({ type: 'quick-cost', results, tables: tablesForBatch, trackedOnly });
         return res.totalCents;
       };
 
@@ -1269,11 +1338,11 @@
       await chrome.storage.local.set({ [collectionKeyFor(sig)]: col });
       await loadLimitsAndCutsFor(sig);
       await updateCachePill();
-      setBusy(false);
+      release();
       await computeBasketFromCollection();
     } catch (error) {
       hideProgress();
-      setBusy(false);
+      release();
       record({ type: 'error', message: error.message });
       toast(`Fetch failed: ${error.message}`, 'error');
     }
@@ -1281,6 +1350,7 @@
 
   // ---- Primary Button: Compute Basket (enforces 8-hour cache rule!) ----
   async function handleComputeClick() {
+    if (workInProgress()) return;
     const info = await inspectSelectionCache();
     if (info.status === 'empty') {
       toast('Select at least one Wants List or Extra Product first.', 'error');
@@ -1414,6 +1484,7 @@
   }
 
   async function openSavedCollection(col) {
+    if (workInProgress()) return;
     if (!Array.isArray(col?.results) || !col.stats?.finishedAt) {
       toast('Not a valid Better Wizard run file.', 'error');
       return;
@@ -1532,14 +1603,14 @@
         </div>
         ${learned.length ? '<button type="button" id="btnRebuildTracked" class="btn btn-primary btn-sm">Recompute basket</button>' : ''}
       </div>`;
-      $('btnRebuildTracked')?.addEventListener('click', () => computeBasketFromCollection());
+      $('btnRebuildTracked')?.addEventListener('click', () => { if (!workInProgress()) computeBasketFromCollection(); });
     } catch (error) {
       out.innerHTML = `<div class="alert-banner alert-warn" style="margin-bottom:12px">Could not read cart: ${esc(error.message)}</div>`;
     }
   }
 
   async function addToCart() {
-    if (!state.basket) return;
+    if (!state.basket || state.fetching || state.carting || state.optimising) return;
     const n = Math.max(1, Number($('buySellers').value) || state.basket.parcels.length);
     const parcels = state.basket.parcels.slice(0, n);
     const { key: cartKey, added } = await alreadyAdded();
@@ -1559,8 +1630,11 @@
     if (!totalItems) { toast(`All ${skipped} items from these sellers were already added to your cart.`); return; }
     if (!confirm(`Add ${totalItems} items from ${orders.length} sellers to your Cardmarket cart?` + (skipped ? `\n(${skipped} already added earlier will be skipped.)` : ''))) return;
 
-    setBusy(true, 'fetch');
-    const runner = createRunner(site, { intervalMs: state.interval, signal: state.controller.signal, waitForUser, log: record });
+    state.carting = true;
+    const controller = new AbortController();
+    state.controller = controller;
+    syncBusyUI();
+    const runner = createRunner(site, { intervalMs: state.interval, signal: controller.signal, waitForUser, log: record });
     const failed = [];
     let done = 0;
     const mark = async items => {
@@ -1583,6 +1657,11 @@
             await mark(groupItems);
           } catch (error) {
             if (error instanceof BlockedError) throw error;
+            if (error instanceof RetryableError || error instanceof RefusedError || error instanceof TypeError) {
+              // The outcome is unknown and the items may already be in the cart: retrying per item could duplicate them.
+              failed.push(`${groupItems.map(item => item.name).join(', ')} (${order.seller}): ${error.message}. Check your Cardmarket cart before retrying`);
+              continue;
+            }
             for (const item of groupItems) {
               try {
                 await runner.call('addToCart', item.idArticle, item.amount, g);
@@ -1605,7 +1684,9 @@
       hideProgress();
       toast(`Stopped after ${done}/${totalItems}: ${error.message}`, 'error');
     } finally {
-      setBusy(false);
+      if (state.controller === controller) state.controller = null;
+      state.carting = false;
+      syncBusyUI();
     }
   }
 
@@ -1771,6 +1852,7 @@
     });
 
     $('shipTo').addEventListener('change', async () => {
+      if (workInProgress()) { $('shipTo').value = state.shipTo; return; }
       state.shipTo = Number($('shipTo').value);
       await saveSettings();
       if (state.collection) await computeBasketFromCollection();
@@ -1778,6 +1860,7 @@
     $('method').addEventListener('change', async () => { state.method = $('method').value; await saveSettings(); });
     $('interval').addEventListener('change', async () => { state.interval = Number($('interval').value); await saveSettings(); });
     $('trackedSellers').addEventListener('change', async () => {
+      if (workInProgress()) { $('trackedSellers').value = Object.keys(state.trackedSellers).sort().join(', '); return; }
       const names = $('trackedSellers').value.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
       const next = Object.fromEntries(names.map(n => [n, state.trackedSellers[n] || Date.now()]));
       await rememberTracked(next);

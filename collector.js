@@ -658,11 +658,23 @@
     let refusals = 0;
     let pausesWithoutSuccess = 0;
 
+    // One shared prompt however many concurrent slots hit a check at the same time.
+    function promptUser(message, attempt) {
+      if (!pause) {
+        pause = waitForUser(message, attempt).then(
+          () => { log({ type: 'resume' }); },
+          () => { blocked = blocked || new StoppedError('Stopped.'); },
+        ).finally(() => { pause = null; });
+      }
+      return pause;
+    }
+
     function read(method, args, bucket) {
       return run(async () => {
         let firstFailure, retries = 0, prompted = false;
         try {
           for (;;) {
+            if (pause) await pause;
             if (signal?.aborted) throw new StoppedError('Stopped.');
             if (blocked) throw blocked;
             await pace.wait(bucket);
@@ -686,7 +698,7 @@
                 prompted = true;
                 stats.pauses += 1;
                 await sleepUntil(until, signal);
-                await waitForUser(`${error.message} after ${retries} retries.`, -1);
+                await promptUser(`${error.message} after ${retries} retries.`, -1);
               } else {
                 retries += 1;
                 stats.retries += 1;
@@ -737,10 +749,7 @@
               stats.pauses += 1;
               pace.intervalMs = Math.min(Math.round(pace.intervalMs * 1.5), 10000);
               log({ type: 'pause', reason: error.message, requests: stats.requests, intervalMs: pace.intervalMs });
-              pause = waitForUser(error.message, pausesWithoutSuccess).then(
-                () => { log({ type: 'resume' }); },
-                () => { blocked = blocked || new StoppedError('Stopped.'); },
-              ).finally(() => { pause = null; });
+              promptUser(error.message, pausesWithoutSuccess);
             }
             await pause;
             attempt -= 1;
@@ -748,6 +757,8 @@
           }
           if (error instanceof BlockedError) { blocked = blocked || error; throw error; }
           if (!(error instanceof RetryableError)) throw error;
+          // A 5xx on a cart POST may already have added the items; only rate limits are safe to retry.
+          if (bucket === 'cart' && error.cause !== 'rate') throw error;
           if (error.retryAfterMs && waits < maxWaits) {
             waits += 1;
             stats.waits += 1;
@@ -846,11 +857,15 @@
       };
       const cutoff = () => {
         const price = target();
-        return price === null ? Infinity : Math.max(price * cutoffFactor, price + cutoffMarginCents);
+        const limit = price === null ? Infinity : Math.max(price * cutoffFactor, price + cutoffMarginCents);
+        return entry.maxPriceCents != null ? Math.min(limit, entry.maxPriceCents) : limit;
       };
 
       function keep(query, list) {
-        for (const offer of list) offers.set(offer.idArticle, { ...offer, idProduct: query.idProduct });
+        for (const offer of list) {
+          if (entry.maxPriceCents != null && offer.priceCents > entry.maxPriceCents) continue;
+          offers.set(offer.idArticle, { ...offer, idProduct: query.idProduct });
+        }
       }
 
       async function read(query, method) {
@@ -944,6 +959,7 @@
       const result = {
         key: entry.key, name: entry.name, amount: entry.amount,
         kind: 'card', game: entry.game || 'Magic', listId: entry.listId ?? null, listName: entry.listName ?? null,
+        maxPriceCents: entry.maxPriceCents ?? null,
         targetCents: target() ?? fallback,
         cutoffCents: Number.isFinite(limit) ? limit : null,
         verdict: gaps.some(query => query.status === 'error') ? 'incomplete'
@@ -1017,6 +1033,7 @@
   }
 
   function matchesWant(entry, offer) {
+    if (entry.maxPriceCents != null && offer.priceCents > entry.maxPriceCents) return false;
     if (entry.kind === 'product') {
       return (!entry.languages?.length || offer.language === null || entry.languages.includes(offer.language)) &&
         (entry.minCondition == null || offer.condition <= entry.minCondition);
@@ -1075,6 +1092,11 @@
         if (!byProduct.has(key)) byProduct.set(key, []);
         byProduct.get(key).push(entry);
       }
+      if (!(entry.printings || []).length && !entry.anyPrinting && entry.idProduct != null) {
+        const key = `${entry.game || 'Magic'}:${entry.idProduct}`;
+        if (!byProduct.has(key)) byProduct.set(key, []);
+        byProduct.get(key).push(entry);
+      }
     }
     const offers = new Map(entries.map(entry => [entry.key, new Map()]));
     const sellerLocations = new Map();
@@ -1089,17 +1111,22 @@
         return true;
       }
       const printings = new Set((entry.printings || []).map(printing => printing.idProduct));
-      if (offer.idProduct !== null ? !printings.has(offer.idProduct) : !entry.anyPrinting) return false;
+      if (printings.size === 0) {
+        // A want whose printing is missing from the catalogue: any printing accepts any identified offer, a specific one only its own id.
+        if (offer.idProduct === null ? !entry.anyPrinting
+          : !(entry.anyPrinting || (entry.idProduct != null && offer.idProduct === entry.idProduct))) return false;
+      } else if (offer.idProduct !== null ? !printings.has(offer.idProduct) : !entry.anyPrinting) return false;
       if (!matchesWant(entry, offer)) return false;
       offers.get(entry.key).set(offer.idArticle, offer);
       return true;
     };
     const progress = (phase, done, total) => onProgress({ phase, done, total, requests: stats.requests, retries: stats.retries });
 
+    const capPrice = (entry, cents) => (entry.maxPriceCents != null ? Math.min(cents, entry.maxPriceCents) : cents);
     const cutoffOf = entry => {
       const sorted = [...offers.get(entry.key).values()].sort((a, b) => a.priceCents - b.priceCents);
       const target = targetPrice(sorted, entry.amount, targetCopies, targetSellers);
-      return target === null ? Infinity : Math.max(target * cutoffFactor, target + cutoffMarginCents);
+      return capPrice(entry, target === null ? Infinity : Math.max(target * cutoffFactor, target + cutoffMarginCents));
     };
 
     let done = 0;
@@ -1192,7 +1219,7 @@
       const target = targetPrice(sorted, entry.amount, targetCopies, targetSellers);
       targets.set(entry.key, {
         targetCents: target,
-        cutoffCents: target === null ? null : Math.max(target * cutoffFactor, target + cutoffMarginCents),
+        cutoffCents: target === null ? null : capPrice(entry, Math.max(target * cutoffFactor, target + cutoffMarginCents)),
       });
     }
 
@@ -1223,6 +1250,7 @@
         key: entry.key, name: state.resolvedName || entry.name, amount: entry.amount,
         kind: entry.kind || 'card', game: entry.game || state.resolvedMeta?.game || 'Magic',
         listId: entry.listId ?? null, listName: entry.listName ?? null,
+        maxPriceCents: entry.maxPriceCents ?? null,
         category: entry.category || state.resolvedMeta?.category || null,
         productPath: entry.productPath || state.resolvedMeta?.path || null,
         targetCents: targetCents ?? fallback, cutoffCents,

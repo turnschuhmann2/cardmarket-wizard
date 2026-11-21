@@ -113,7 +113,7 @@
         <span style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:7px;background:#4f46e5;color:#fff;font-weight:700;font-size:13px">BW</span>
         <div>
           <strong style="font-size:14px">Better Wizard · Extra Product</strong>
-          <div data-bw-prod-status style="font-size:12.5px;color:#475569">Bundle this ${category.toLowerCase()} with your card orders to save shipping.</div>
+          <div data-bw-prod-status style="font-size:12.5px;color:#475569"></div>
         </div>
       </div>
       <div style="display:flex;align-items:center;gap:8px">
@@ -128,6 +128,7 @@
     (document.querySelector('main h1')?.closest('.row, div') || document.querySelector('main') || document.body).after(bar);
 
     const statusEl = bar.querySelector('[data-bw-prod-status]');
+    statusEl.textContent = `Bundle this ${category.toLowerCase()} with your card orders to save shipping.`;
     const addBtn = bar.querySelector('[data-bw-add]');
 
     const refreshState = async () => {

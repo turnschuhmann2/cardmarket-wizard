@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 require('../collector.js');
-const { collect, browserSite, RetryableError, BlockedError } = globalThis.CardmarketCollector;
+const { collect, createRunner, browserSite, RetryableError, BlockedError } = globalThis.CardmarketCollector;
 
 // A fake Cardmarket: offers per printing, served cheapest-first, 50 per page, at most 300 per query.
 function fakeSite(catalogue, { failFirst = 0, broken = new Set(), blockAfter = Infinity } = {}) {
@@ -220,4 +220,32 @@ test('browser site goes straight to a known product page and logs redirects', as
   await assert.rejects(site.firstPage(query(3)));
   assert.match(urls[1], /^\/en\/Magic\/Products\?idProduct=3&/);
   assert.equal(seen[1].redirectedTo, '/en/Magic/Products/Singles/Set/Card');
+});
+
+test('a want\'s maximum price caps the offers and the cutoff', async () => {
+  const catalogue = { 1: offers(20, 100, 10) };
+  const wanted = { ...entry([{ idProduct: 1, guideLowCents: 100 }]), maxPriceCents: 150 };
+  const [result] = (await collect({ entries: [wanted] }, fakeSite(catalogue), options)).results;
+  assert.equal(result.maxPriceCents, 150);
+  assert.equal(result.cutoffCents, 150, 'cutoff is clamped to the maximum price');
+  assert.ok(result.offers.length > 0);
+  assert.ok(result.offers.every(offer => offer.priceCents <= 150), 'no offer above the maximum price is kept');
+});
+
+test('a 5xx on a cart request is not retried, but a rate limit is', async () => {
+  const runnerOptions = { retryDelayMs: 1, intervalMs: 0, bucketIntervals: {} };
+  let serverCalls = 0;
+  const failing = createRunner({ async addToCart() { serverCalls += 1; throw new RetryableError('HTTP 500'); } }, runnerOptions);
+  await assert.rejects(failing.call('addToCart', 1, 1), /HTTP 500/);
+  assert.equal(serverCalls, 1, 'the cart POST is sent once');
+
+  let rateCalls = 0;
+  const limited = createRunner({
+    async addToCart() {
+      rateCalls += 1;
+      if (rateCalls === 1) throw new RetryableError('HTTP 429', { cause: 'rate' });
+    },
+  }, runnerOptions);
+  await limited.call('addToCart', 1, 1);
+  assert.equal(rateCalls, 2, 'a 429 is retried');
 });

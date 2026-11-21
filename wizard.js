@@ -462,10 +462,10 @@
 
     const pause = () => new Promise(resolve => setTimeout(resolve, 0));
 
-    async function search(basket, { seed = 1, shake = 3, breadth = 150, start = 'basket' }, deadline) {
+    async function search(basket, { seed = 1, shake = 3, breadth = 150, start = 'basket' }, deadline, isCancelled = () => false) {
       const next = random(seed);
       const candidates = [...sellers.keys()];
-      const timeLeft = () => Date.now() < deadline;
+      const timeLeft = () => !isCancelled() && Date.now() < deadline;
 
       function helpful(assignment) {
         const paid = new Map();
@@ -529,20 +529,24 @@
       return best;
     }
 
-    async function optimise(basket, { timeMs = 10000, strategies = STRATEGIES, onProgress = () => {} } = {}) {
+    async function optimise(basket, { timeMs = 10000, strategies = STRATEGIES, onProgress = () => {}, isCancelled = () => false } = {}) {
       const initialCents = total(basket.assignment) + (units.length - basket.assignment.size) * MISSING_CENTS;
       const share = timeMs / strategies.length;
       const results = [];
       let best = null;
       for (const strategy of strategies) {
+        if (isCancelled()) break;
         const started = Date.now();
-        const found = await search(basket, strategy, started + share);
+        const found = await search(basket, strategy, started + share, isCancelled);
+        if (isCancelled()) break;
         const assignment = improve(costOf(found.chosen).assignment);
         const cents = total(assignment) + (units.length - assignment.size) * MISSING_CENTS;
         results.push({ strategy: strategy.name, cents, sellers: new Set([...assignment.values()].map(pick => pick.seller)).size, ms: Date.now() - started });
         if (!best || cents < best.cents) best = { cents, assignment, strategy: strategy.name };
         onProgress({ cents: best.cents, sellers: results.at(-1).sellers, strategy: strategy.name, done: results.length, of: strategies.length });
       }
+      // Superseded jobs stop early with nothing better than what came in.
+      if (!best) return Object.assign(basket, { search: { results, winner: 'quick basket', quickCents: initialCents } });
       // Never hand back something dearer than what came in.
       const chosen = best.cents < initialCents ? describe(best.assignment) : basket;
       return Object.assign(chosen, { search: { results, winner: best.cents < initialCents ? best.strategy : 'quick basket', quickCents: initialCents } });

@@ -137,21 +137,22 @@ async function fetchShipping(from, to) {
 async function fetchShippingMulti(fromList, to) {
   const unique = [...new Set(fromList.map(Number).filter(Boolean))];
   const tables = {};
+  const failed = [];
   const queue = [...unique];
   const workers = Array.from({ length: Math.min(6, queue.length) }, async () => {
     while (queue.length) {
       const from = queue.shift();
+      const name = COUNTRY_NAME_BY_ID[from] || String(from);
       try {
-        const methods = await fetchShipping(from, to);
-        const name = COUNTRY_NAME_BY_ID[from] || String(from);
-        tables[name] = methods;
+        tables[name] = await fetchShipping(from, to);
       } catch (error) {
-        // Skip unsupported pairs rather than failing the whole European batch.
+        // Report unsupported pairs rather than failing the whole European batch.
+        failed.push(name);
       }
     }
   });
   await Promise.all(workers);
-  return tables;
+  return { tables, failed };
 }
 
 async function printings(ids) {
@@ -173,6 +174,14 @@ async function printings(ids) {
   return Object.fromEntries(ids.map(id => [id, known[id] ?? null]));
 }
 
+// Only the extension's own app page may drive the Cardmarket bridge tab.
+function isAppSender(sender) {
+  if (sender?.id !== chrome.runtime.id) return false;
+  const appUrl = chrome.runtime.getURL('app.html');
+  const url = sender?.url || '';
+  return url === appUrl || url.startsWith(`${appUrl}?`) || url.startsWith(`${appUrl}#`);
+}
+
 chrome.runtime.onMessage.addListener((message, sender, reply) => {
   if (!message || typeof message !== 'object') return false;
 
@@ -182,6 +191,10 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
   }
 
   if (message.type === 'cm-fetch') {
+    if (!isAppSender(sender)) {
+      reply({ error: 'Unauthorised sender' });
+      return false;
+    }
     (async () => {
       try {
         const tabId = await getCardmarketTab();
@@ -195,6 +208,10 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
   }
 
   if (message.type === 'cm-token') {
+    if (!isAppSender(sender)) {
+      reply({ token: null });
+      return false;
+    }
     (async () => {
       try {
         const tabId = await getCardmarketTab();
@@ -215,7 +232,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
 
   if (message.type === 'shipping-multi') {
     fetchShippingMulti(message.fromList || [], message.to)
-      .then(tables => reply({ tables }), error => reply({ error: String(error) }));
+      .then(({ tables, failed }) => reply({ tables, failed }), error => reply({ error: String(error) }));
     return true;
   }
 

@@ -5,6 +5,7 @@
 
   chrome.runtime.onMessage.addListener((message, sender, reply) => {
     if (!message || typeof message !== 'object') return false;
+    if (sender?.id !== chrome.runtime.id) return false;
 
     if (message.type === 'cm-ping') {
       reply({
@@ -23,8 +24,23 @@
     if (message.type === 'cm-fetch') {
       (async () => {
         try {
+          let target;
+          try {
+            target = new URL(message.url, location.href);
+          } catch {
+            target = null;
+          }
+          if (target?.origin !== 'https://www.cardmarket.com') {
+            reply({ error: 'Blocked non-Cardmarket URL' });
+            return;
+          }
+          const method = String(message.method || 'GET').toUpperCase();
+          if (method !== 'GET' && method !== 'POST') {
+            reply({ error: `Blocked HTTP method ${method}` });
+            return;
+          }
           const init = {
-            method: message.method || 'GET',
+            method,
             credentials: 'include',
           };
           if (Array.isArray(message.formEntries)) {
@@ -32,7 +48,7 @@
             for (const [k, v] of message.formEntries) body.append(k, v);
             init.body = body;
           }
-          const response = await fetch(message.url, init);
+          const response = await fetch(target.href, init);
           const text = await response.text();
           reply({
             ok: response.ok,

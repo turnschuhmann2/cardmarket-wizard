@@ -38,7 +38,11 @@
       const all = idMetacard ? index.metacards[idMetacard] : null;
       if (!all) {
         warnings.push(`${want.name}: printing ${want.idProduct} is not in the catalogue`);
-        return { ...want, printings: [] };
+        // A specific printing missing from the catalogue can still be matched by its own id.
+        const printings = !want.anyPrinting && want.idProduct != null
+          ? [{ idProduct: want.idProduct, idExpansion: null, guideLowCents: null }]
+          : [];
+        return { ...want, printings };
       }
       let printings = all;
       if (!want.anyPrinting) {

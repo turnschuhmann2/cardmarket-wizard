@@ -21,9 +21,15 @@ function serializeBasket(basket) {
   };
 }
 
+// Latest job id per long-running type; an older job stops as soon as a newer one arrives.
+const latestJob = { optimise: 0, 'suggest-limits': 0 };
+
 self.onmessage = async event => {
   const msg = event.data;
   if (!msg || !msg.id) return;
+  if (msg.type in latestJob) latestJob[msg.type] = msg.id;
+  const isCancelled = () => msg.type in latestJob && latestJob[msg.type] !== msg.id;
+  const postCancelled = () => self.postMessage({ id: msg.id, event: 'done', cancelled: true });
 
   try {
     if (msg.type === 'optimise') {
@@ -49,8 +55,10 @@ self.onmessage = async event => {
 
       let best = await planner.optimise(quick, {
         timeMs,
+        isCancelled,
         onProgress: info => self.postMessage({ id: msg.id, event: 'progress', ...info }),
       });
+      if (isCancelled()) { postCancelled(); return; }
 
       let keptPrevious = false;
       if (Array.isArray(previousPicks) && previousPicks.length) {
@@ -85,7 +93,8 @@ self.onmessage = async event => {
       // Baseline basket with baseRules (without a limit on this scope).
       const baseFiltered = filterByLimits(collection.results, baseRules, manualCuts);
       const basePlanner = createPlanner({ ...collection, results: baseFiltered.kept }, tables, { trackedOnly });
-      const baseQuick = await basePlanner.optimise(basePlanner.basket(), { timeMs: 450, strategies: [STRATEGIES[0]] });
+      const baseQuick = await basePlanner.optimise(basePlanner.basket(), { timeMs: 450, strategies: [STRATEGIES[0]], isCancelled });
+      if (isCancelled()) { postCancelled(); return; }
 
       const options = [];
       for (const cents of candidates) {
@@ -95,7 +104,8 @@ self.onmessage = async event => {
         const trialRules = [...baseRules, { ...scope, cents }];
         const { kept } = filterByLimits(collection.results, trialRules, manualCuts);
         const planner = createPlanner({ ...collection, results: kept }, tables, { trackedOnly });
-        const quick = await planner.optimise(planner.basket(), { timeMs: 450, strategies: [STRATEGIES[0]] });
+        const quick = await planner.optimise(planner.basket(), { timeMs: 450, strategies: [STRATEGIES[0]], isCancelled });
+        if (isCancelled()) { postCancelled(); return; }
 
         const option = {
           cents,
