@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cardmarket Better Wizard</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="brand">
+        <span class="brand-mark">BW</span>
+        <div>
+          <div class="brand-title">Cardmarket Better Wizard</div>
+          <div class="brand-sub">Multi-list · Cross-game · Europe · Accessories</div>
+        </div>
+      </div>
+      <div id="cachePill" class="cache-pill cache-none" title="Offer cache status for your current selection">
+        <span class="pill-dot"></span>
+        <span id="cachePillText">No selection</span>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <button type="button" id="btnCompute" class="btn btn-primary btn-lg">
+        <span class="btn-spinner" hidden></span>
+        <span id="btnComputeLabel">Compute Basket</span>
+      </button>
+      <button type="button" id="btnRefetch" class="btn btn-secondary" title="Ignore cache and fetch fresh offers from Cardmarket">
+        Refetch offers
+      </button>
+      <button type="button" id="btnStop" class="btn btn-danger" hidden>Stop</button>
+      <div class="divider-v"></div>
+      <select id="savedRuns" class="select select-sm" title="Saved runs">
+        <option value="">Saved runs…</option>
+      </select>
+      <button type="button" id="btnOpenRun" class="btn btn-ghost btn-sm">Open</button>
+      <label class="btn btn-ghost btn-sm file-btn">
+        Import JSON
+        <input type="file" id="importFile" accept=".json,application/json" hidden>
+      </label>
+      <button type="button" id="btnDownload" class="btn btn-ghost btn-sm" hidden>Export JSON</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <!-- Wants Lists -->
+      <section class="card">
+        <div class="card-head">
+          <h2>Wants Lists</h2>
+          <button type="button" id="btnClearLists" class="btn btn-ghost btn-xs" hidden>Clear</button>
+        </div>
+        <p class="card-hint">Paste a Cardmarket Wants List link (or click <em>Open Better Wizard</em> on a Wants List page).</p>
+        <div class="inline-form">
+          <input type="url" id="manualListUrl" class="input" placeholder="https://www.cardmarket.com/en/Magic/Wants/12345">
+          <button type="button" id="btnAddManualList" class="btn btn-secondary btn-sm">Add</button>
+        </div>
+        <div id="listsContainer" class="lists-body">
+          <div class="empty-mini">No Wants Lists added yet.</div>
+        </div>
+      </section>
+
+      <!-- Extra Products -->
+      <section class="card">
+        <div class="card-head">
+          <h2>Extra Products</h2>
+          <span class="badge badge-neutral">Sleeves · Boxes · Sealed</span>
+        </div>
+        <p class="card-hint">Paste any Cardmarket non-single product link (or click <em>+ Add to Better Wizard</em> on a product page).</p>
+        <div class="inline-form">
+          <input type="url" id="productUrlInput" class="input" placeholder="https://www.cardmarket.com/en/Magic/Products/Sleeves/...">
+          <button type="button" id="btnAddProduct" class="btn btn-secondary btn-sm">Add</button>
+        </div>
+        <div id="productsList" class="products-body"></div>
+      </section>
+
+      <!-- Region & Settings -->
+      <section class="card">
+        <div class="card-head">
+          <h2>Region &amp; Settings</h2>
+        </div>
+
+        <label class="field-label">Buy from sellers in</label>
+        <div class="segmented" id="regionMode">
+          <button type="button" data-region="de" class="seg-btn active">Germany</button>
+          <button type="button" data-region="eu" class="seg-btn">All Europe</button>
+          <button type="button" data-region="custom" class="seg-btn">Custom</button>
+        </div>
+
+        <div id="customCountriesBox" class="custom-countries" hidden>
+          <div class="preset-row">
+            <button type="button" data-preset="neighbours" class="btn btn-subtle btn-xs">DE + Neighbours</button>
+            <button type="button" data-preset="eu" class="btn btn-subtle btn-xs">All EU</button>
+            <button type="button" data-preset="clear" class="btn btn-subtle btn-xs">Clear</button>
+          </div>
+          <div id="countryCheckboxes" class="country-grid"></div>
+        </div>
+
+        <div class="field-grid">
+          <div>
+            <label class="field-label" for="shipTo">Ship to</label>
+            <select id="shipTo" class="select"></select>
+          </div>
+          <div>
+            <label class="field-label" for="method">Fetch depth</label>
+            <select id="method" class="select">
+              <option value="sellers">Quick (~5 min)</option>
+              <option value="thorough">Thorough (~15 min)</option>
+              <option value="printings">Every printing (slow)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <label class="field-label" for="interval">Request speed</label>
+          <select id="interval" class="select">
+            <option value="1000">Careful (1 req / sec)</option>
+            <option value="2000">Very careful (1 req / 2 sec)</option>
+            <option value="500">Faster (2 req / sec)</option>
+          </select>
+        </div>
+
+        <div class="field-row">
+          <label class="field-label" for="trackedSellers" title="Sellers Cardmarket forces to ship tracked (auto-learned from your cart).">
+            Tracked-only sellers
+          </label>
+          <input id="trackedSellers" class="input" placeholder="Auto-learned from cart, or comma-separated names">
+        </div>
+      </section>
+    </aside>
+
+    <main class="workspace">
+      <!-- Live status & progress -->
+      <section id="progressBanner" class="progress-banner" hidden>
+        <div class="progress-head">
+          <div class="progress-title-wrap">
+            <span class="pulse-dot"></span>
+            <strong id="progressTitle">Working…</strong>
+          </div>
+          <span id="progressMeta" class="progress-meta"></span>
+        </div>
+        <div class="progress-track">
+          <div id="progressFill" class="progress-fill" style="width: 0%"></div>
+        </div>
+        <div id="progressSub" class="progress-sub"></div>
+      </section>
+
+      <!-- Verification pause notice -->
+      <section id="pauseBanner" class="alert-banner alert-warn" hidden>
+        <div>
+          <strong>Paused:</strong> <span id="pauseText"></span>
+        </div>
+        <div class="alert-actions">
+          <button type="button" id="btnContinue" class="btn btn-primary btn-sm">Continue</button>
+          <button type="button" id="btnPauseStop" class="btn btn-danger btn-sm">Stop</button>
+        </div>
+      </section>
+
+      <!-- Incomplete collection or cart notice -->
+      <div id="topNotice"></div>
+
+      <!-- Empty state before first run -->
+      <section id="emptyState" class="empty-hero">
+        <div class="empty-icon">✨</div>
+        <h1>Ready to build your cheapest basket</h1>
+        <p id="emptyText">Select one or more Wants Lists (Magic and/or Yu-Gi-Oh!) or add extra products like sleeves on the left, then click <strong>Compute Basket</strong>.</p>
+        <div class="empty-tips">
+          <div class="tip-box">
+            <strong>8-hour smart cache</strong>
+            <span>Re-computing, tweaking price limits, or dropping cards runs instantly from cache with zero refetches.</span>
+          </div>
+          <div class="tip-box">
+            <strong>Cross-game &amp; accessories</strong>
+            <span>Sellers carrying both Magic, Yu-Gi-Oh!, and sleeves combine into a single parcel to cut shipping.</span>
+          </div>
+          <div class="tip-box">
+            <strong>Scoped price limits</strong>
+            <span>Apply separate max price limits per game or per Wants List and recompute the whole basket live.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Results container -->
+      <div id="resultsArea" hidden>
+        <!-- KPI Strip -->
+        <section class="kpi-grid" id="kpiGrid">
+          <div class="kpi-card">
+            <div class="kpi-label">Total Basket</div>
+            <div class="kpi-value" id="kpiTotal">–</div>
+            <div class="kpi-sub" id="kpiTotalSub"></div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Items + Shipping</div>
+            <div class="kpi-value" id="kpiSplit">–</div>
+            <div class="kpi-sub" id="kpiSplitSub"></div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Sellers</div>
+            <div class="kpi-value" id="kpiSellers">–</div>
+            <div class="kpi-sub" id="kpiSellersSub"></div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Items Covered</div>
+            <div class="kpi-value" id="kpiItems">–</div>
+            <div class="kpi-sub" id="kpiItemsSub"></div>
+          </div>
+        </section>
+
+        <!-- Scoped Price Limits -->
+        <section class="card feature-card" id="limitsCard">
+          <div class="card-head">
+            <div>
+              <h2>Price Limits <span class="badge badge-indigo">Per-game &amp; Per-list</span></h2>
+              <p class="card-hint">Leave out expensive cards (e.g. to proxy) for all cards, a single game, or one Wants List. The entire combined basket recomputes from cache.</p>
+            </div>
+            <button type="button" id="btnToggleLimits" class="btn btn-secondary btn-sm">Estimate limits</button>
+          </div>
+
+          <div id="activeLimitsBar" class="active-limits" hidden></div>
+
+          <div id="limitsEditor" class="limits-editor" hidden>
+            <div class="scope-bar">
+              <span class="scope-label">Apply to:</span>
+              <div id="scopePills" class="scope-pills"></div>
+            </div>
+            <div id="limitsTableWrap" class="limits-table-wrap"></div>
+          </div>
+        </section>
+
+        <!-- Cards Worth Buying Elsewhere + Left Out -->
+        <section class="card feature-card" id="cutsCard">
+          <div id="leftOutBar" class="leftout-bar" hidden></div>
+          <div id="cutsBody"></div>
+        </section>
+
+        <!-- Tabs -->
+        <section class="card workspace-card">
+          <div class="tabs-bar">
+            <button type="button" class="tab-btn active" data-tab="sellers">Basket by Seller <span class="tab-count" id="tabCountSellers">0</span></button>
+            <button type="button" class="tab-btn" data-tab="curve">Coverage Curve</button>
+            <button type="button" class="tab-btn" data-tab="overlap">Top Sellers</button>
+            <button type="button" class="tab-btn" data-tab="coverage">Fetch Coverage</button>
+          </div>
+
+          <!-- Tab: Basket by Seller -->
+          <div class="tab-panel active" data-panel="sellers">
+            <div class="basket-toolbar">
+              <div class="toolbar-group">
+                <label class="inline-label">Buy from first
+                  <input type="number" id="buySellers" class="input input-num" min="1" value="1">
+                  sellers
+                </label>
+                <span id="buySummary" class="toolbar-summary"></span>
+              </div>
+              <div class="toolbar-group">
+                <button type="button" id="btnBuy" class="btn btn-primary btn-sm">Add to Cardmarket cart</button>
+                <button type="button" id="btnCheckCart" class="btn btn-secondary btn-sm">Check cart shipping</button>
+                <button type="button" id="btnCopyPlain" class="btn btn-ghost btn-sm">Copy list</button>
+                <button type="button" id="btnCopyArchidekt" class="btn btn-ghost btn-sm" hidden>Copy for Archidekt</button>
+                <button type="button" id="btnForgetCart" class="btn btn-link btn-xs">Forget added</button>
+              </div>
+            </div>
+            <div id="cartCheckBox"></div>
+            <div id="missingBox"></div>
+            <div id="sellersControls" class="sellers-controls" hidden>
+              <span id="sellersExpandedInfo" class="sellers-controls-info"></span>
+              <div class="sellers-controls-actions">
+                <button type="button" id="btnExpandAllSellers" class="btn btn-secondary btn-xs">Expand all</button>
+                <button type="button" id="btnCollapseAllSellers" class="btn btn-secondary btn-xs">Collapse all</button>
+              </div>
+            </div>
+            <div id="parcelsList" class="parcels-list"></div>
+          </div>
+
+          <!-- Tab: Coverage Curve -->
+          <div class="tab-panel" data-panel="curve">
+            <p class="card-hint">Sellers ordered by lowest cost above market per item. Click any row to set how many sellers to add to your cart.</p>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>First N</th>
+                    <th>Items</th>
+                    <th>Coverage</th>
+                    <th>Total</th>
+                    <th>Per item</th>
+                    <th>Seller added</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="curveBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Tab: Top Sellers -->
+          <div class="tab-panel" data-panel="overlap">
+            <p class="card-hint">Sellers holding the most of your wanted items across all selected lists and games.</p>
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Seller</th>
+                    <th>Country</th>
+                    <th>Games</th>
+                    <th>Your items</th>
+                    <th>At/below market</th>
+                    <th>Items subtotal</th>
+                  </tr>
+                </thead>
+                <tbody id="overlapBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Tab: Fetch Coverage -->
+          <div class="tab-panel" data-panel="coverage">
+            <div id="coverageMeta" class="coverage-meta"></div>
+            <div id="coverageTables" class="table-scroll"></div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <!-- Cache Alert Modal (>8h or missing cache) -->
+  <div id="cacheModal" class="modal-backdrop" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="cacheModalTitle">
+      <div class="modal-icon">⏱️</div>
+      <h3 id="cacheModalTitle">Offer cache needs a refresh</h3>
+      <p id="cacheModalBody"></p>
+      <div class="modal-actions">
+        <button type="button" id="modalCancel" class="btn btn-ghost">Cancel</button>
+        <button type="button" id="modalUseOld" class="btn btn-secondary" hidden>Compute from old cache</button>
+        <button type="button" id="modalRefetch" class="btn btn-primary">Refetch all &amp; Compute</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast notifications -->
+  <div id="toastHost" class="toast-host"></div>
+
+  <script src="collector.js"></script>
+  <script src="wizard.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

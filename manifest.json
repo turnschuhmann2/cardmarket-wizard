@@ -1,30 +1,46 @@
 {
   "manifest_version": 3,
   "name": "Cardmarket Better Wizard",
-  "version": "0.4.0",
-  "description": "Collects the cheapest offers for every printing on a Cardmarket Wants List and reports how complete the collection is.",
+  "version": "0.6.0",
+  "description": "Full-page basket optimiser for Cardmarket across multiple Wants Lists, games (Magic & Yu-Gi-Oh!), European sellers, and accessories.",
   "permissions": [
     "storage",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "tabs"
   ],
   "host_permissions": [
     "https://downloads.s3.cardmarket.com/*",
     "https://help.cardmarket.com/*",
-    "https://api.scryfall.com/*"
+    "https://api.scryfall.com/*",
+    "https://www.cardmarket.com/*"
   ],
+  "action": {
+    "default_title": "Open Cardmarket Better Wizard"
+  },
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
       "matches": [
-        "https://www.cardmarket.com/*/Magic/Wants/*"
+        "https://www.cardmarket.com/*"
       ],
       "js": [
-        "collector.js",
-        "wizard.js",
+        "bridge.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.cardmarket.com/*/Magic/Wants/*",
+        "https://www.cardmarket.com/*/YuGiOh/Wants/*",
+        "https://www.cardmarket.com/*/Magic/Products/*",
+        "https://www.cardmarket.com/*/YuGiOh/Products/*"
+      ],
+      "js": [
         "content.js"
-      ]
+      ],
+      "run_at": "document_idle"
     }
   ]
 }

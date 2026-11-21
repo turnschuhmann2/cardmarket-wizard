@@ -8,11 +8,11 @@
  * the expensive tail cannot skew it. We keep every offer up to the cutoff,
  * max(2 x target, target + 0,50 EUR).
  *
- * Each printing is read cheapest-first until its prices pass the cutoff. A printing whose
- * price-guide low (the minimum over all languages, conditions and countries) is already above
- * the cutoff is skipped without a request. More offers can only lower the target, so a skip
- * stays valid for the rest of the run. Results report, per card, whether every offer up to the
- * cutoff was read.
+ * Supports:
+ * - Single or multiple Wants Lists across games (Magic, Yu-Gi-Oh!) combined in one run.
+ * - Non-card products (sleeves, deck boxes, etc.), reading per-seller shipping directly from
+ *   the product page's offer rows.
+ * - Seller-country filtering (single country, custom set, or all of Europe).
  */
 (function (root) {
   'use strict';
@@ -27,6 +27,7 @@
   const CONDITION_CODES = ['MT', 'NM', 'EX', 'GD', 'LP', 'PL', 'PO'];
   // Private, professional, powerseller. Verified: the three filters partition a printing's offers.
   const SELLER_TYPES = [0, 1, 2];
+  const CACHE_MAX_AGE_MS = 8 * 60 * 60 * 1000;
 
   class RetryableError extends Error {}
   class BlockedError extends Error {}
@@ -39,6 +40,16 @@
     const match = /(\d[\d.]*),(\d{2})/.exec(text || '');
     if (!match) throw new Error(`Unreadable price "${text}"`);
     return parseInt(match[1].replace(/\./g, ''), 10) * 100 + parseInt(match[2], 10);
+  }
+
+  function allCents(text) {
+    const out = [];
+    const regex = /(\d[\d.]*),(\d{2})\s*€/g;
+    let match;
+    while ((match = regex.exec(text || '')) !== null) {
+      out.push(parseInt(match[1].replace(/\./g, ''), 10) * 100 + parseInt(match[2], 10));
+    }
+    return out;
   }
 
   function tip(element) {
@@ -79,6 +90,57 @@
     };
   }
 
+  // Non-card product offer rows (sleeves, deck boxes, sealed items):
+  // - Condition is optional (sealed accessories have no condition icon).
+  // - Language is optional.
+  // - Cardmarket renders per-seller shipping directly in the offer cell (including commercial
+  //   sellers' custom Personal Shipping Methods).
+  function parseProductOfferRow(row) {
+    const sellerLink = row.querySelector('.seller-name a[href*="/Users/"]');
+    const sellerTips = tips(row, '.col-seller');
+    const location = sellerTips.find(text => text.startsWith('Item location: '));
+    const attributes = tips(row, '.product-attributes');
+    const condition = attributes.find(text => text in CONDITIONS);
+    const language = attributes.find(text => text in LANGUAGES);
+    const priceEl = row.querySelector('.price-container .color-primary') || row.querySelector('.col-offer .color-primary');
+    const quantity = row.querySelector('.amount-container .item-count') || row.querySelector('.item-count');
+    if (!sellerLink || !location || !priceEl || !quantity) {
+      throw new Error(`Unreadable product offer row ${row.id}`);
+    }
+    const priceCents = cents(priceEl.textContent);
+
+    // Try explicit shipping icon / container first, then fall back to the 2nd euro amount in the offer cell.
+    let shippingCents = null;
+    const priceBox = row.querySelector('.price-container') || row.querySelector('.col-offer') || row;
+    const shipIcon = priceBox.querySelector('[class*="shipping"], [class*="delivery"], [class*="package"], [title*="Shipping"], [data-bs-original-title*="Shipping"]');
+    if (shipIcon) {
+      const candidate = shipIcon.closest('div, span, p')?.textContent || shipIcon.parentElement?.textContent || '';
+      const found = allCents(candidate);
+      if (found.length) shippingCents = found.at(-1);
+    }
+    if (shippingCents === null) {
+      const amounts = allCents(priceBox.textContent);
+      if (amounts.length >= 2) shippingCents = amounts[1];
+    }
+
+    const rating = /fonticon-seller-rating-([a-z-]+)/.exec(row.querySelector('[class*="fonticon-seller-rating-"]')?.className || '');
+    return {
+      idArticle: Number(row.id.replace('articleRow', '')),
+      seller: sellerLink.textContent.trim(),
+      location: location.slice('Item location: '.length),
+      professional: sellerTips.includes('Professional') || sellerTips.includes('Powerseller'),
+      rating: rating ? rating[1] : null,
+      condition: condition ? CONDITIONS[condition] : 2,
+      language: language ? LANGUAGES[language] : null,
+      foil: false,
+      signed: false,
+      altered: false,
+      priceCents,
+      shippingCents,
+      quantity: parseInt(quantity.textContent, 10),
+    };
+  }
+
   // Product id of a row, from its thumbnail image URL (.../<idProduct>/<idProduct>.jpg).
   function productOf(row) {
     const image = /\/(\d+)\/\d+\.\w+/.exec(row.querySelector('[data-bs-title*="product-images"]')?.getAttribute('data-bs-title') || '');
@@ -90,11 +152,13 @@
   }
 
   function queryString(query, withProduct = true) {
-    const params = new URLSearchParams(withProduct ? { idProduct: query.idProduct, language: query.language } : { language: query.language });
-    if (query.sellerCountries.length) params.set('sellerCountry', query.sellerCountries.join(','));
-    if (query.minCondition < 7) params.set('minCondition', query.minCondition);
+    const params = new URLSearchParams();
+    if (withProduct && query.idProduct != null) params.set('idProduct', query.idProduct);
+    if (query.language != null) params.set('language', query.language);
+    if (query.sellerCountries?.length) params.set('sellerCountry', query.sellerCountries.join(','));
+    if (query.minCondition != null && query.minCondition < 7) params.set('minCondition', query.minCondition);
     for (const [name, value] of [['isFoil', query.foil], ['isSigned', query.signed], ['isAltered', query.altered]]) {
-      if (value !== 'any') params.set(name, value);
+      if (value && value !== 'any') params.set(name, value);
     }
     if (query.sellerType !== undefined) params.set('sellerType', query.sellerType);
     if (query.expansions?.length) params.set('idExpansion', query.expansions.join(','));
@@ -107,11 +171,11 @@
     const echo = JSON.parse(raw.replace(/\\+,/g, ','));
     const languages = Object.keys(echo.idLanguage || {}).map(Number);
     const problems = [];
-    if (languages.length !== 1 || languages[0] !== query.language) problems.push('language');
-    if (query.sellerCountries.length &&
+    if (query.language != null && (languages.length !== 1 || languages[0] !== query.language)) problems.push('language');
+    if (query.sellerCountries?.length &&
         [...(echo.idCountries || [])].sort().join() !== [...query.sellerCountries].sort().join()) problems.push('seller country');
     const conditions = echo.condition || CONDITION_CODES;
-    if (conditions.join() !== CONDITION_CODES.slice(0, query.minCondition).join()) problems.push('condition');
+    if (query.minCondition != null && conditions.join() !== CONDITION_CODES.slice(0, query.minCondition).join()) problems.push('condition');
     if (query.sellerType !== undefined && (echo.sellerStatus || []).join() !== String(query.sellerType)) problems.push('seller type');
     if (query.expansions?.length &&
         Object.keys(echo.idExpansions || {}).map(Number).sort((a, b) => a - b).join() !== [...query.expansions].sort((a, b) => a - b).join()) {
@@ -121,10 +185,11 @@
   }
 
   function checkOffer(offer, query) {
-    if (offer.language !== query.language || offer.condition > query.minCondition ||
-        (query.foil !== 'any' && offer.foil !== (query.foil === 'Y')) ||
-        (query.signed !== 'any' && offer.signed !== (query.signed === 'Y')) ||
-        (query.altered !== 'any' && offer.altered !== (query.altered === 'Y'))) {
+    if ((query.language != null && offer.language !== query.language) ||
+        (query.minCondition != null && offer.condition > query.minCondition) ||
+        (query.foil && query.foil !== 'any' && offer.foil !== (query.foil === 'Y')) ||
+        (query.signed && query.signed !== 'any' && offer.signed !== (query.signed === 'Y')) ||
+        (query.altered && query.altered !== 'any' && offer.altered !== (query.altered === 'Y'))) {
       throw new Error(`Offer ${offer.idArticle} does not match the requested filters`);
     }
   }
@@ -134,10 +199,132 @@
     return new TextDecoder().decode(bytes);
   }
 
-  // Reads Cardmarket pages through fetch in a logged-in cardmarket.com tab.
-  // paths: optional Map-like store of each product's page path. /Products?idProduct= redirects to
-  // that path, so knowing it saves one request per printing. onResponse sees every HTTP response.
-  function browserSite({ fetchImpl = root.fetch.bind(root), paths = null, onResponse = () => {} } = {}) {
+  const WANTS_ACTION_OR_GENERIC = /^(view(\s*\/\s*edit)?(\s+list)?|edit(\s+list)?|delete|remove|shopping wizard|wizard|open|show|details?|(my\s+)?wants(\s+lists?)?|edit\s+wants(\s+list)?)$/i;
+
+  function cleanHeadingText(el) {
+    if (!el) return '';
+    let node = el;
+    if (typeof el.cloneNode === 'function') {
+      node = el.cloneNode(true);
+      if (typeof node.querySelectorAll === 'function') {
+        for (const extra of node.querySelectorAll('small, span.h4, .subtitle, .badge, button, a.btn, .visually-hidden, .sr-only')) {
+          extra.remove?.();
+        }
+      }
+    }
+    return (node.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  // Extracts the human-readable Wants List name from a Wants List detail page (/en/<Game>/Wants/<id>).
+  function parseWantsListName(page, listId) {
+    const candidates = [
+      cleanHeadingText(page.querySelector?.('main h1') || page.querySelector?.('h1')),
+      page.querySelector?.('input[name="name"], input[name="wantslistName"], input[name="title"]')?.value,
+      cleanHeadingText(page.querySelector?.('.page-title-container h2, main h2')),
+      cleanHeadingText(page.querySelector?.('.breadcrumb-item.active, nav[aria-label="breadcrumb"] .active')),
+      (page.title || page.querySelector?.('title')?.textContent || '')
+        .replace(/\s*[|–-]\s*Cardmarket.*$/i, '')
+        .replace(/^(my\s+)?wants(\s+list)?\s*[:–-]\s*/i, ''),
+    ];
+    for (const raw of candidates) {
+      const text = String(raw || '').replace(/\s+/g, ' ').trim();
+      if (text && !WANTS_ACTION_OR_GENERIC.test(text)) return text;
+    }
+    return `Wants List ${listId}`;
+  }
+
+  // Reads a Wants List overview page (/en/Magic/Wants or /en/YuGiOh/Wants).
+  function parseWantsOverview(page, game = 'Magic') {
+    const pattern = new RegExp(`/${game}/Wants/(\\d+)(?:[/?#]|$)`);
+    const seen = new Map();
+    for (const link of page.querySelectorAll('a[href*="/Wants/"]')) {
+      const href = link.getAttribute('href') || '';
+      const match = pattern.exec(href);
+      if (!match) continue;
+      const listId = match[1];
+      if (seen.has(listId)) continue;
+
+      const linkText = (link.textContent || '').replace(/\s+/g, ' ').trim();
+      const row = link.closest?.('tr') || null;
+      const card = link.closest?.('.card') || link.closest?.('.card-body') || link.closest?.('article, li') || null;
+
+      let name = '';
+      if (linkText && !WANTS_ACTION_OR_GENERIC.test(linkText)) {
+        name = linkText;
+      } else if (card) {
+        const headings = [
+          card.querySelector?.('.card-title'),
+          card.querySelector?.('h2, h3, h4, h5, h6'),
+          card.querySelector?.('.card-header'),
+        ];
+        for (const el of headings) {
+          const text = cleanHeadingText(el);
+          if (text && !WANTS_ACTION_OR_GENERIC.test(text)) { name = text; break; }
+        }
+      } else if (row) {
+        const linkTd = link.closest?.('td');
+        const cells = [...(row.querySelectorAll?.('th, td') || [])];
+        const nameCell = cells.find(cell => {
+          if (cell === linkTd) return false;
+          const text = (cell.textContent || '').replace(/\s+/g, ' ').trim();
+          return text && !/^\d+$/.test(text) && !WANTS_ACTION_OR_GENERIC.test(text);
+        });
+        if (nameCell) name = nameCell.textContent.replace(/\s+/g, ' ').trim();
+      }
+      if (!name) continue;
+
+      let count = null;
+      if (row) {
+        const linkTd = link.closest?.('td');
+        const countCell = [...(row.querySelectorAll?.('td') || [])]
+          .find(td => td !== linkTd && /^\d+$/.test((td.textContent || '').trim()));
+        if (countCell) count = parseInt(countCell.textContent.trim(), 10);
+      } else if (card) {
+        const badge = card.querySelector?.('.badge');
+        const badgeText = (badge?.textContent || '').trim();
+        if (/^\d+$/.test(badgeText)) {
+          count = parseInt(badgeText, 10);
+        } else {
+          const countMatch = /\b(\d+)\s*(?:cards?|items?|articles?|wants?|entries?)\b/i.exec(card.textContent || '');
+          if (countMatch) count = parseInt(countMatch[1], 10);
+        }
+      }
+      const path = new URL(href, 'https://www.cardmarket.com').pathname;
+      seen.set(listId, { game, listId, name, count, path });
+    }
+    return [...seen.values()];
+  }
+
+  // Extracts metadata from a Cardmarket non-single product page.
+  function parseProductPageMeta(page, url) {
+    const parsed = new URL(url, 'https://www.cardmarket.com');
+    const pathMatch = /^\/[^/]+\/(Magic|YuGiOh|Pokemon|OnePiece|Lorcana)\/Products\/([^/]+)\/(.+)$/i.exec(parsed.pathname);
+    const game = pathMatch ? pathMatch[1] : 'Magic';
+    const category = pathMatch ? decodeURIComponent(pathMatch[2]).replace(/-/g, ' ') : 'Product';
+    const idInput = page.querySelector('input[name="idProduct"]');
+    const idProduct = idInput ? Number(idInput.value) : null;
+    const h1 = page.querySelector('main h1') || page.querySelector('h1');
+    const titleClone = h1 ? h1.cloneNode(true) : null;
+    if (titleClone) {
+      for (const small of titleClone.querySelectorAll('small, span.h4, .subtitle')) small.remove();
+    }
+    const name = (titleClone?.textContent || page.title || parsed.pathname.split('/').pop() || 'Product')
+      .replace(/\s*\|.*$/, '').replace(/\s+/g, ' ').trim();
+    return {
+      game,
+      category,
+      idProduct: Number.isFinite(idProduct) ? idProduct : null,
+      name,
+      path: parsed.pathname,
+    };
+  }
+
+  // Reads Cardmarket pages through fetch in a logged-in cardmarket.com tab (or via bridgeFetch).
+  function browserSite({ fetchImpl = root.fetch.bind(root), paths = null, onResponse = () => {}, game = 'Magic', getToken = null, baseOrigin = '' } = {}) {
+    const baseFor = g => `${baseOrigin}/en/${g || game}`;
+    const resolveUrl = path => (path.startsWith('http') ? path : `${baseOrigin}${path}`);
+    const originRef = baseOrigin || (typeof location !== 'undefined' ? location.href : 'https://www.cardmarket.com');
+
     async function request(url, init) {
       const started = Date.now();
       let response, text;
@@ -151,15 +338,11 @@
       const title = (/<title>([^<]{0,120})/i.exec(text.slice(0, 3000))?.[1] || '').trim();
       onResponse({
         method: init?.method || 'GET', url, status: response.status, ms: Date.now() - started, bytes: text.length,
-        redirectedTo: response.redirected ? new URL(response.url, location.href).pathname : null,
+        redirectedTo: response.redirected ? new URL(response.url, originRef).pathname : null,
         cfMitigated: response.headers.get('cf-mitigated'), retryAfter: response.headers.get('retry-after'), title: title || null,
-        // What a refusal said, for the log.
         snippet: response.ok ? null : text.replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300),
       });
-      // An interactive check (observed: HTTP 429 or 403 with cf-mitigated: challenge, "Just a moment...").
       if (response.headers.get('cf-mitigated') === 'challenge' || /^just a moment/i.test(title)) {
-        // Can apply to one kind of request only (observed: add-to-cart challenged for a while after
-        // many adds, while pages loaded, then let through again after a wait).
         throw new BlockedError('Cardmarket is refusing this kind of request for now (verification check).');
       }
       if (response.status === 403 || /attention required|access denied/i.test(title) && !response.ok && response.status !== 429) {
@@ -174,28 +357,42 @@
         error.readRetryAfterMs = /^\d+$/.test(header || '') ? seconds * 1000 : Math.max(0, Date.parse(header) - Date.now()) || 0;
         throw error;
       }
-      if (/\/(login|signup)\b/i.test(new URL(response.url, location.href).pathname)) {
+      if (/\/(login|signup)\b/i.test(new URL(response.url, originRef).pathname)) {
         throw Object.assign(new BlockedError('Cardmarket asked for a login. Log in, then resume.'), { login: true });
       }
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       return { text, url: response.url };
     }
 
-    async function cartRequest(action, items) {
-      const token = document.querySelector('[name="__cmtkn"]')?.value;
-      if (!token) throw new Error('No Cardmarket session token on this page');
+    async function resolveToken(gameOverride) {
+      if (getToken) {
+        const t = await getToken(gameOverride || game);
+        if (t) return t;
+      }
+      if (typeof document !== 'undefined') {
+        const local = document.querySelector('[name="__cmtkn"]')?.value;
+        if (local) return local;
+      }
+      // Fallback: read token from ShoppingCart page.
+      const { text } = await request(`${baseFor(gameOverride)}/ShoppingCart`);
+      const match = /name="__cmtkn"[^>]*value="([^"]+)"/i.exec(text) || /value="([^"]+)"[^>]*name="__cmtkn"/i.exec(text);
+      if (match) return match[1];
+      throw new Error('No Cardmarket session token on this page');
+    }
+
+    async function cartRequest(action, items, gameOverride) {
+      const token = await resolveToken(gameOverride);
       const body = new FormData();
       body.append('__cmtkn', token);
       for (const { idArticle, amount } of items) {
         body.append(`idArticle[${idArticle}]`, String(idArticle));
         body.append(`amount[${idArticle}]`, String(amount));
       }
-      const { text } = await request(`/en/Magic/AjaxAction/${action}`, { method: 'POST', body });
+      const { text } = await request(`${baseFor(gameOverride)}/AjaxAction/${action}`, { method: 'POST', body });
       const xml = new DOMParser().parseFromString(text, 'text/xml');
       const value = name => xml.getElementsByTagName(name)[0]?.textContent;
       const code = value('resultsCode') ? decodeBase64(value('resultsCode')) : null;
       if (code !== 'generalOK') {
-        // Keep what Cardmarket actually said (observed 2026-11-20: a reply without any result code).
         const said = value('resultsMessage') ? decodeBase64(value('resultsMessage')) : text;
         throw new Error(`Cardmarket answered ${code ?? 'without a result code'}: ${said.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)}`);
       }
@@ -226,16 +423,43 @@
     }
 
     return {
+      async wantsOverview(gameOverride) {
+        const g = gameOverride || game;
+        const { text: html } = await request(`${baseFor(g)}/Wants`);
+        const page = new DOMParser().parseFromString(html, 'text/html');
+        return parseWantsOverview(page, g);
+      },
+
+      async wantsList(gameOverride, listId) {
+        const g = gameOverride || game;
+        const { text: html } = await request(`${baseFor(g)}/Wants/${listId}`);
+        const page = new DOMParser().parseFromString(html, 'text/html');
+        const name = parseWantsListName(page, listId);
+        return { game: g, listId: String(listId), name, wants: parseWantsList(page, g) };
+      },
+
+      async wantsListInfo(gameOverride, listId) {
+        const g = gameOverride || game;
+        const { text: html } = await request(`${baseFor(g)}/Wants/${listId}`);
+        const page = new DOMParser().parseFromString(html, 'text/html');
+        const name = parseWantsListName(page, listId);
+        let count = null;
+        try { count = parseWantsList(page, g).length; } catch { count = 0; }
+        return { game: g, listId: String(listId), name, count, path: `/en/${g}/Wants/${listId}` };
+      },
+
       async firstPage(query) {
+        const g = query.game || game;
         const known = paths?.get(query.idProduct);
-        const { text: html, url } = await request(known ? `${known}?${queryString(query, false)}` : `/en/Magic/Products?${queryString(query)}`);
+        const qs = queryString(query, !known);
+        const { text: html, url } = await request(known ? `${resolveUrl(known)}${qs ? `?${qs}` : ''}` : `${baseFor(g)}/Products?${qs}`);
         const page = new DOMParser().parseFromString(html, 'text/html');
         const table = page.querySelector('#table');
         const ids = new Set([...page.querySelectorAll('input[name="idProduct"]')].map(input => Number(input.value)));
         if (!table || ids.size !== 1 || !ids.has(query.idProduct)) {
           throw new Error(`Product ${query.idProduct} did not load as expected`);
         }
-        if (!known) paths?.set(query.idProduct, new URL(url, location.href).pathname);
+        if (!known) paths?.set(query.idProduct, new URL(url, originRef).pathname);
         const offers = rowsFrom(table, query);
         const button = page.getElementById('loadMoreButton');
         const form = button?.closest('form');
@@ -251,13 +475,14 @@
       },
 
       async nextPage(query, cursor) {
+        const g = query.game || game;
         const body = new FormData();
         body.append('__cmtkn', cursor.token);
         body.append('page', String(cursor.page));
         body.append('filterSettings', cursor.filterSettings);
         body.append('idProduct', String(query.idProduct));
         const xml = new DOMParser().parseFromString(
-          (await request('/en/Magic/AjaxAction/Product_LoadMoreArticles', { method: 'POST', body })).text, 'text/xml');
+          (await request(`${baseFor(g)}/AjaxAction/Product_LoadMoreArticles`, { method: 'POST', body })).text, 'text/xml');
         const value = name => xml.getElementsByTagName(name)[0]?.textContent;
         if (value('newPage') === undefined) throw new Error('Unexpected load-more response');
         const container = new DOMParser().parseFromString(`<div>${value('rows') ? decodeBase64(value('rows')) : ''}</div>`, 'text/html');
@@ -268,9 +493,9 @@
       },
 
       // A card's page lists offers across all its printings, cheapest first (50 per page).
-      // Rows that cannot be read are skipped and counted rather than failing the card.
       async cardPage(entry, query) {
-        const { text: html } = await request(`${entry.cardPath}?${queryString(query, false)}`);
+        const qs = queryString(query, false);
+        const { text: html } = await request(`${resolveUrl(entry.cardPath)}${qs ? `?${qs}` : ''}`);
         const page = new DOMParser().parseFromString(html, 'text/html');
         if (!page.querySelector('#table')) throw new Error(`${entry.name} did not load as expected`);
         const form = page.getElementById('loadMoreButton')?.closest('form');
@@ -280,11 +505,36 @@
         return { offers, skipped };
       },
 
+      // A non-card product page (sleeves, deck boxes, etc.): 1 plain GET, reading both price and
+      // per-seller shipping from each row.
+      async productPage(entry, query) {
+        const qs = queryString(query, false);
+        const target = entry.productPath || entry.url;
+        const { text: html, url } = await request(`${resolveUrl(target)}${qs ? `?${qs}` : ''}`);
+        const page = new DOMParser().parseFromString(html, 'text/html');
+        const table = page.querySelector('#table');
+        if (!table) throw new Error(`${entry.name || target} did not load as expected`);
+        const meta = parseProductPageMeta(page, url);
+        const offers = [];
+        let skipped = 0;
+        for (const row of table.querySelectorAll('.article-row[id^="articleRow"]')) {
+          try {
+            const offer = { ...parseProductOfferRow(row), idProduct: meta.idProduct };
+            if (query.language != null && offer.language !== null && offer.language !== query.language) continue;
+            if (query.minCondition != null && query.minCondition < 7 && offer.condition > query.minCondition) continue;
+            offers.push(offer);
+          } catch (error) {
+            skipped += 1;
+          }
+        }
+        return { offers, skipped, meta };
+      },
+
       // A seller's offers filtered by "Is in my Wants List?": 20 per page, every printing, any price.
-      async sellerWants(seller, listId, pageNumber) {
+      async sellerWants(seller, listId, pageNumber, gameOverride) {
         const params = new URLSearchParams({ idWantslist: listId });
         if (pageNumber > 1) params.set('site', pageNumber);
-        const { text: html } = await request(`/en/Magic/Users/${encodeURIComponent(seller)}/Offers/Singles?${params}`);
+        const { text: html } = await request(`${baseFor(gameOverride)}/Users/${encodeURIComponent(seller)}/Offers/Singles?${params}`);
         const page = new DOMParser().parseFromString(html, 'text/html');
         if (!page.querySelector('#UserOffersTable')) throw new Error(`Offers of ${seller} did not load as expected`);
         const offers = [];
@@ -305,29 +555,25 @@
         }
         const total = parseInt((page.querySelector('.total-count')?.textContent || '').replace(/\D/g, ''), 10);
         const hasNext = [...page.querySelectorAll('a[href*="site="]')]
-          .some(link => new URL(link.getAttribute('href'), location.href).searchParams.get('site') === String(pageNumber + 1));
+          .some(link => new URL(link.getAttribute('href'), originRef).searchParams.get('site') === String(pageNumber + 1));
         return { offers, skipped, total: Number.isFinite(total) ? total : null, hasNext };
       },
 
-      async addToCart(idArticle, amount) {
-        await cartRequest('ShoppingCart_Add_AddArticlesFromProductPage', [{ idArticle, amount }]);
+      async addToCart(idArticle, amount, gameOverride) {
+        await cartRequest('ShoppingCart_Add_AddArticlesFromProductPage', [{ idArticle, amount }], gameOverride);
       },
 
       // What the cart says per seller: article value, shipping, and the shipping methods offered.
-      // A seller whose methods are all tracked must ship tracked (observed: Snirbs offered only
-      // "Tracked Letter (3,95 EUR)" and "Tracked Parcel" for 4 cards worth 4,21 EUR).
-      async cartShipping() {
-        const { text: html } = await request('/en/Magic/ShoppingCart');
+      async cartShipping(gameOverride) {
+        const { text: html } = await request(`${baseFor(gameOverride)}/ShoppingCart`);
         const page = new DOMParser().parseFromString(html, 'text/html');
         return [...page.querySelectorAll('section.shipment-block')].map(section => {
           const text = section.textContent.replace(/\s+/g, ' ');
           const amount = label => {
-            // The page text has no space between label and amount ("Article Value3,40 €Shipping1,40 €").
             const match = new RegExp(`${label}\\s*(\\d[\\d.]*,\\d{2})\\s*€`).exec(text);
             return match ? cents(match[1]) : null;
           };
           const methods = [...new Set([...section.querySelectorAll('select[name="idShippingMethod"] option')].map(option => option.textContent.trim()))];
-          // How "Remove articles from this seller" works, recorded so removal can be automated later.
           const remove = [...section.querySelectorAll('a, button')].find(element => /remove articles from this seller/i.test(element.textContent));
           return {
             removeControl: remove ? (remove.closest('form') || remove).outerHTML.replace(/\s+/g, ' ').slice(0, 600) : null,
@@ -338,9 +584,8 @@
         }).filter(shipment => shipment.seller);
       },
 
-      // All chosen offers of one seller in one request, like "Put selected in cart" on a seller's page.
-      async addSellerToCart(items) {
-        await cartRequest('ShoppingCart_Add_AddArticlesFromUserOffers', items);
+      async addSellerToCart(items, gameOverride) {
+        await cartRequest('ShoppingCart_Add_AddArticlesFromUserOffers', items, gameOverride);
       },
     };
   }
@@ -375,10 +620,6 @@
     });
   }
 
-  // Starts requests at least intervalMs apart across the whole run. Cardmarket limits page types
-  // separately (observed: /Products blocked with Retry-After while /Cards and /Users still answered),
-  // so a Retry-After holds back only requests of the same type.
-  // bucketIntervals: a longer minimum gap for some page types (e.g. adding to the cart).
   function pacer(intervalMs, bucketIntervals = {}) {
     let nextAt = 0;
     const holds = new Map();
@@ -396,9 +637,12 @@
     };
   }
 
-  const BUCKETS = { firstPage: 'products', nextPage: 'products', cardPage: 'cards', sellerWants: 'users', addToCart: 'cart', addSellerToCart: 'cart' };
+  const BUCKETS = {
+    firstPage: 'products', nextPage: 'products', productPage: 'products',
+    cardPage: 'cards', sellerWants: 'users',
+    addToCart: 'cart', addSellerToCart: 'cart',
+  };
 
-  // Runs site requests with pacing, retries, Retry-After holds, and pauses for verification checks.
   function createRunner(site, options) {
     const {
       concurrency = 2, intervalMs = 1000, bucketIntervals = { cart: 2000 }, maxRetries = 4, maxWaits = 6, retryDelayMs = 2000,
@@ -414,9 +658,6 @@
     let refusals = 0;
     let pausesWithoutSuccess = 0;
 
-    // Reads (card and seller pages): a rate limit, a verification check or a refusal is retried after
-    // 5, 10, 20, 40 and 80 s (all requests of that page type wait together), as long as the waiting
-    // stays within readRetryBudgetMs; then Continue is offered once. Only a login request stops at once.
     function read(method, args, bucket) {
       return run(async () => {
         let firstFailure, retries = 0, prompted = false;
@@ -483,12 +724,10 @@
           if (error instanceof RefusedError) {
             refusals += 1;
             log({ type: 'refused', method, error: error.message, inARow: refusals });
-            // Several refusals in a row: Cardmarket is refusing everything for now, so stop.
             if (refusals >= 3 && !blocked) blocked = new StoppedError(`${error.message} Stopped after ${refusals} refusals in a row; try again later.`);
             throw error;
           }
           if (error instanceof BlockedError && !(error instanceof StoppedError) && waitForUser && !blocked) {
-            // Still refused after several waits in a row: stop rather than wait forever.
             if (!pause && pausesWithoutSuccess >= maxPausesWithoutSuccess) {
               blocked = new StoppedError(`Cardmarket still refused after ${pausesWithoutSuccess} waits in a row. Stopped; try again later.`);
               throw blocked;
@@ -496,7 +735,6 @@
             if (!pause) {
               pausesWithoutSuccess += 1;
               stats.pauses += 1;
-              // A check means we were too fast for Cardmarket: continue more slowly.
               pace.intervalMs = Math.min(Math.round(pace.intervalMs * 1.5), 10000);
               log({ type: 'pause', reason: error.message, requests: stats.requests, intervalMs: pace.intervalMs });
               pause = waitForUser(error.message, pausesWithoutSuccess).then(
@@ -510,7 +748,6 @@
           }
           if (error instanceof BlockedError) { blocked = blocked || error; throw error; }
           if (!(error instanceof RetryableError)) throw error;
-          // Cardmarket said how long to wait: hold this page type that long, then try again.
           if (error.retryAfterMs && waits < maxWaits) {
             waits += 1;
             stats.waits += 1;
@@ -525,7 +762,6 @@
           }
           if (attempt >= maxRetries) throw error;
           stats.retries += 1;
-          // A plain 429 means everything should slow down, not just this request.
           if (error.cause === 'rate') pace.intervalMs = Math.min(pace.intervalMs * 2, 10000);
           log({ type: 'retry', method, error: error.message, attempt, intervalMs: pace.intervalMs });
           await sleep(retryDelayMs * 2 ** attempt);
@@ -540,41 +776,63 @@
     };
   }
 
-  const cacheKey = query => [query.idProduct, query.language, [...query.sellerCountries].sort().join('.'), query.minCondition,
-    query.foil, query.signed, query.altered, query.sellerType ?? ''].join('|');
+  const cacheKey = query => [query.game || 'Magic', query.idProduct, query.language ?? '', [...(query.sellerCountries || [])].sort().join('.'), query.minCondition ?? '',
+    query.foil ?? 'any', query.signed ?? 'any', query.altered ?? 'any', query.sellerType ?? ''].join('|');
 
-  // cache: optional Map-like store of query snapshots, so a stopped run resumes and reruns are cheap.
-  // waitForUser(message): optional; when Cardmarket shows a check or asks for a login, the run waits
-  // for the returned promise (the user passed the check) instead of stopping. Rejecting it stops.
-  // log(event): optional; receives one object per notable step.
   async function collect(plan, site, options = {}) {
     const {
       targetCopies = 5, targetSellers = 3, cutoffFactor = 2, cutoffMarginCents = 50, sellerCountries = [7],
       concurrency = 2, entryConcurrency = 2, intervalMs = 1000, wave = 4,
-      onProgress = () => {}, log = () => {}, cache = null, cacheMaxAgeMs = 6 * 60 * 60 * 1000,
+      onProgress = () => {}, log = () => {}, cache = null, cacheMaxAgeMs = CACHE_MAX_AGE_MS,
     } = options;
     const runner = createRunner(site, options);
     const { call, stats } = runner;
-    log({ type: 'run-start', cards: plan.entries.length, printings: plan.entries.reduce((sum, entry) => sum + entry.printings.length, 0),
+    log({ type: 'run-start', cards: plan.entries.length, printings: plan.entries.reduce((sum, entry) => sum + (entry.printings?.length || 0), 0),
       sellerCountries, intervalMs, concurrency, entryConcurrency, targetCopies, targetSellers, cutoffFactor, cutoffMarginCents });
 
     async function collectEntry(entry) {
+      if (entry.kind === 'product') {
+        const query = {
+          game: entry.game || 'Magic', language: entry.languages?.length === 1 ? entry.languages[0] : null,
+          sellerCountries, minCondition: entry.minCondition ?? 7,
+        };
+        const pKey = ['product', entry.productPath || entry.url, query.language ?? '', [...sellerCountries].sort().join('.'), query.minCondition].join('|');
+        const hit = cache?.get(pKey);
+        let page;
+        if (hit && Date.now() - hit.at < cacheMaxAgeMs) {
+          stats.cachedQueries += 1;
+          page = hit.value;
+        } else {
+          page = await call('productPage', entry, query);
+          cache?.set(pKey, { at: Date.now(), value: page });
+        }
+        const sorted = [...page.offers].sort((a, b) => (a.priceCents + (a.shippingCents || 0)) - (b.priceCents + (b.shippingCents || 0)));
+        const target = targetPrice(sorted, entry.amount, targetCopies, targetSellers) ?? sorted[0]?.priceCents ?? null;
+        return {
+          key: entry.key, name: page.meta?.name || entry.name, amount: entry.amount,
+          kind: 'product', game: entry.game || page.meta?.game || 'Magic',
+          category: entry.category || page.meta?.category || 'Product', productPath: entry.productPath || page.meta?.path || null,
+          listId: entry.listId ?? null, listName: entry.listName ?? null,
+          targetCents: target, cutoffCents: null,
+          verdict: sorted.length ? 'complete' : 'unavailable',
+          printings: 1, requests: hit ? 0 : 1, queries: [], offers: sorted,
+        };
+      }
+
       const offers = new Map();
       const queries = [];
       for (const printing of entry.printings) {
         for (const language of entry.languages) {
           queries.push({
-            idProduct: printing.idProduct, guideLowCents: printing.guideLowCents ?? null, language,
+            game: entry.game || 'Magic', idProduct: printing.idProduct, guideLowCents: printing.guideLowCents ?? null, language,
             sellerCountries, minCondition: entry.minCondition, foil: entry.foil, signed: entry.signed,
             altered: entry.altered, status: 'pending', pages: 0, lastPriceCents: null, cursor: null, error: null,
           });
         }
       }
-      // Printings without a guide price are never skipped, so read them after the priced ones.
       const order = query => query.guideLowCents ?? Number.MAX_SAFE_INTEGER;
       queries.sort((a, b) => order(a) - order(b));
 
-      // Null until enough copies from enough sellers have been seen.
       const target = () => {
         const needed = Math.max(targetCopies, entry.amount);
         const sellers = new Set();
@@ -598,7 +856,6 @@
       async function read(query, method) {
         if (method === 'firstPage') {
           const cached = cache?.get(cacheKey(query));
-          // A cached snapshot that stopped below the cutoff has no cursor left, so it is read again.
           if (cached && !query.refetch && Date.now() - cached.at < cacheMaxAgeMs &&
               (cached.status !== 'open' || cached.lastPriceCents > cutoff())) {
             Object.assign(query, { status: cached.status, lastPriceCents: cached.lastPriceCents, cachedAt: cached.at });
@@ -631,12 +888,10 @@
         }
       }
 
-      // First pages, cheapest guide price first, until the guide proves the rest too expensive.
       let next = 0;
       while (next < queries.length) {
         const limit = cutoff();
         const batch = [];
-        // Until there is a target, read one printing at a time.
         const size = Number.isFinite(limit) ? wave : 1;
         while (next < queries.length && batch.length < size && !((queries[next].guideLowCents ?? -1) > limit)) {
           batch.push(queries[next++]);
@@ -646,11 +901,9 @@
       }
       for (const query of queries.slice(next)) query.status = query.guideLowCents === null ? 'pending' : 'skipped';
 
-      // Deeper pages while the cheapest unseen offer of a printing could still be under the cutoff.
       for (;;) {
         const limit = cutoff();
         for (const query of queries) {
-          // A printing that hit the 300-offer cap below the cutoff is re-read once per seller type.
           if (query.status === 'capped' && query.lastPriceCents <= limit && query.sellerType === undefined) {
             query.status = 'split';
             for (const sellerType of SELLER_TYPES) {
@@ -683,7 +936,6 @@
       }
       const sorted = [...offers.values()].sort((a, b) => a.priceCents - b.priceCents);
       const copies = sorted.reduce((sum, offer) => sum + offer.quantity, 0);
-      // Too few copies for a target: every offer was read, and the price of the last copy needed stands in.
       let fallback = null;
       for (let i = 0, seen = 0; i < sorted.length && fallback === null; i += 1) {
         seen += sorted[i].quantity;
@@ -691,6 +943,7 @@
       }
       const result = {
         key: entry.key, name: entry.name, amount: entry.amount,
+        kind: 'card', game: entry.game || 'Magic', listId: entry.listId ?? null, listName: entry.listName ?? null,
         targetCents: target() ?? fallback,
         cutoffCents: Number.isFinite(limit) ? limit : null,
         verdict: gaps.some(query => query.status === 'error') ? 'incomplete'
@@ -709,14 +962,17 @@
 
     const results = [];
     let done = 0;
-    // A few cards at a time, so a stop leaves finished cards rather than many half-read ones.
     const cardSlot = limiter(entryConcurrency);
     await Promise.all(plan.entries.map(entry => cardSlot(async () => {
       try {
         results.push(await collectEntry(entry));
       } catch (error) {
         if (!(error instanceof BlockedError)) throw error;
-        results.push({ key: entry.key, name: entry.name, amount: entry.amount, verdict: 'blocked', queries: [], offers: [] });
+        results.push({
+          key: entry.key, name: entry.name, amount: entry.amount,
+          kind: entry.kind || 'card', game: entry.game || 'Magic', listId: entry.listId ?? null, listName: entry.listName ?? null,
+          verdict: 'blocked', queries: [], offers: [],
+        });
       }
       done += 1;
       onProgress({ done, total: plan.entries.length, requests: stats.requests, retries: stats.retries, paused: false });
@@ -729,9 +985,6 @@
       rule: { targetCopies, targetSellers, cutoffFactor, cutoffMarginCents } };
   }
 
-  // Splits a card's printings into groups of at most `size` expansions, cheapest price-guide low
-  // first. Printings without a guide price (often brand new) go into the first group. Without
-  // expansion ids (an index from an older version) there is one unfiltered group.
   function expansionGroups(printings, size) {
     if (!printings.some(printing => printing.idExpansion)) return [{ expansions: null, products: null, minGuideCents: 0 }];
     const order = printing => printing.guideLowCents ?? -1;
@@ -752,8 +1005,6 @@
     return groups;
   }
 
-  // Target price: the price of the n-th cheapest copy (n = max(targetCopies, wanted)) once those
-  // copies come from enough sellers; null if there are not enough yet.
   function targetPrice(sorted, amount, targetCopies, targetSellers) {
     const sellers = new Set();
     let copies = 0;
@@ -766,6 +1017,10 @@
   }
 
   function matchesWant(entry, offer) {
+    if (entry.kind === 'product') {
+      return (!entry.languages?.length || offer.language === null || entry.languages.includes(offer.language)) &&
+        (entry.minCondition == null || offer.condition <= entry.minCondition);
+    }
     return entry.languages.includes(offer.language) && offer.condition <= entry.minCondition &&
       (entry.foil === 'any' || offer.foil === (entry.foil === 'Y')) &&
       (entry.signed === 'any' || offer.signed === (entry.signed === 'Y')) &&
@@ -773,28 +1028,34 @@
   }
 
   /*
-   * Seller-first collection, a few hundred requests instead of one or more per printing:
-   * 1. Each card's own page (all printings, cheapest first) sets its target price and shows
-   *    which sellers are cheap.
-   * 2. The sellers that are cheap for the most cards are asked for every offer they have from
-   *    the Wants List ("Is in my Wants List?"), at any price and in every printing. After the first
-   *    minSellers, more are asked in batches while a batch still lowers the basket by at least
-   *    improvementCents (evaluate(results) prices the basket; without it, only minSellers are asked).
-   * The basket is then built from both. Offers above a card's cutoff only come from step 2, so
-   * a big seller's dearer copy is still on the table and is marked above market.
+   * Seller-first collection across one or many Wants Lists (same or different games) plus optional
+   * non-card products (sleeves, deck boxes, etc.):
+   * 1. Each card's page sets its target price and discovers cheap sellers; each non-card product
+   *    reads 1 plain GET to its product page (including per-seller shipping rates).
+   * 2. The sellers cheap for the most total items across ALL lists/games/products are asked for
+   *    every offer they have from each selected Wants List ("Is in my Wants List?").
    */
   async function collectBySellers(plan, site, options = {}) {
     const {
-      listId, targetCopies = 5, targetSellers = 3, cutoffFactor = 2, cutoffMarginCents = 50, sellerCountries = [7],
+      listId = null, lists = null,
+      targetCopies = 5, targetSellers = 3, cutoffFactor = 2, cutoffMarginCents = 50, sellerCountries = [7],
       minSellers = 40, sellerBatch = 20, sellerLimit = 150, improvementCents = 100, evaluate = null, expansionGroupSize = 12,
       splitBySellerType = false, groupSkipFactor = 1,
       minSellerCards = 2, maxSellerPages = 15,
-      onProgress = () => {}, log = () => {}, cache = null, cacheMaxAgeMs = 6 * 60 * 60 * 1000,
+      onProgress = () => {}, log = () => {}, cache = null, cacheMaxAgeMs = CACHE_MAX_AGE_MS,
     } = options;
     const runner = createRunner(site, options);
     const { call, stats } = runner;
-    log({ type: 'run-start', method: 'sellers', cards: plan.entries.length, sellerCountries, minSellers, sellerBatch, sellerLimit,
-      improvementCents, minSellerCards,
+
+    // Normalise selected Wants Lists (backwards-compatible with single listId).
+    const activeLists = Array.isArray(lists) && lists.length
+      ? lists
+      : listId
+        ? [{ game: plan.entries.find(e => e.kind !== 'product')?.game || 'Magic', listId }]
+        : [];
+
+    log({ type: 'run-start', method: 'sellers', cards: plan.entries.length, lists: activeLists.length, sellerCountries,
+      minSellers, sellerBatch, sellerLimit, improvementCents, minSellerCards,
       intervalMs: options.intervalMs, targetCopies, targetSellers, cutoffFactor, cutoffMarginCents, splitBySellerType, groupSkipFactor, expansionGroupSize });
 
     async function cached(key, fetch) {
@@ -808,16 +1069,26 @@
     const entries = plan.entries;
     const byProduct = new Map();
     for (const entry of entries) {
-      for (const printing of entry.printings) {
-        if (!byProduct.has(printing.idProduct)) byProduct.set(printing.idProduct, []);
-        byProduct.get(printing.idProduct).push(entry);
+      if (entry.kind === 'product') continue;
+      for (const printing of entry.printings || []) {
+        const key = `${entry.game || 'Magic'}:${printing.idProduct}`;
+        if (!byProduct.has(key)) byProduct.set(key, []);
+        byProduct.get(key).push(entry);
       }
     }
     const offers = new Map(entries.map(entry => [entry.key, new Map()]));
+    const sellerLocations = new Map();
     const cardState = new Map(entries.map(entry => [entry.key,
-      { status: 'pending', cardOffers: 0, skipped: 0, pages: 0, groups: 0, groupsSkipped: 0, error: null }]));
+      { status: 'pending', cardOffers: 0, skipped: 0, pages: 0, groups: 0, groupsSkipped: 0, error: null, resolvedName: null, resolvedMeta: null }]));
+
     const keep = (entry, offer) => {
-      const printings = new Set(entry.printings.map(printing => printing.idProduct));
+      if (offer.location && !sellerLocations.has(offer.seller)) sellerLocations.set(offer.seller, offer.location);
+      if (entry.kind === 'product') {
+        if (!matchesWant(entry, offer)) return false;
+        offers.get(entry.key).set(offer.idArticle, offer);
+        return true;
+      }
+      const printings = new Set((entry.printings || []).map(printing => printing.idProduct));
       if (offer.idProduct !== null ? !printings.has(offer.idProduct) : !entry.anyPrinting) return false;
       if (!matchesWant(entry, offer)) return false;
       offers.get(entry.key).set(offer.idArticle, offer);
@@ -825,21 +1096,55 @@
     };
     const progress = (phase, done, total) => onProgress({ phase, done, total, requests: stats.requests, retries: stats.retries });
 
-    // 1. Card pages. Without an expansion filter a card's page only covers its newest printings
-    // (observed: Swords to Plowshares started at 1,15 EUR; filtered to Dominaria Remastered it
-    // started at 0,75 EUR), and with more than about 20 expansions selected it drops some again
-    // (20 worked, 30 did not). So printings are read in groups of up to expansionGroupSize
-    // expansions, cheapest price-guide low first, until the next group cannot beat the cutoff.
     const cutoffOf = entry => {
       const sorted = [...offers.get(entry.key).values()].sort((a, b) => a.priceCents - b.priceCents);
       const target = targetPrice(sorted, entry.amount, targetCopies, targetSellers);
       return target === null ? Infinity : Math.max(target * cutoffFactor, target + cutoffMarginCents);
     };
+
     let done = 0;
     const cardSlot = limiter(2);
+    const countriesKey = [...sellerCountries].sort().join('.');
     await Promise.all(entries.map(entry => cardSlot(async () => {
       const state = cardState.get(entry.key);
-      if (!entry.cardPath) { state.status = 'no card page'; return; }
+      if (entry.kind === 'product') {
+        try {
+          const query = {
+            game: entry.game || 'Magic',
+            language: entry.languages?.length === 1 ? entry.languages[0] : null,
+            sellerCountries,
+            minCondition: entry.minCondition ?? 7,
+          };
+          const key = ['product', entry.productPath || entry.url, query.language ?? '', countriesKey, query.minCondition].join('|');
+          const page = await cached(key, () => call('productPage', entry, query));
+          let kept = 0;
+          for (const offer of page.offers) if (keep(entry, offer)) kept += 1;
+          state.cardOffers += kept;
+          state.skipped += page.skipped || 0;
+          state.pages += 1;
+          state.resolvedName = page.meta?.name || entry.name;
+          state.resolvedMeta = page.meta || null;
+          state.status = 'read';
+          log({ type: 'product-page', product: state.resolvedName, offers: page.offers.length, kept,
+            cheapestCents: page.offers[0]?.priceCents ?? null, cached: !!page.fromCache });
+        } catch (error) {
+          if (error instanceof BlockedError) { state.status = 'blocked'; return; }
+          state.status = 'error';
+          state.error = error.message;
+          log({ type: 'product-error', product: entry.name, error: error.message });
+        } finally {
+          done += 1;
+          progress('cards', done, entries.length);
+        }
+        return;
+      }
+
+      if (!entry.cardPath) {
+        state.status = 'no card page';
+        done += 1;
+        progress('cards', done, entries.length);
+        return;
+      }
       try {
         const groups = expansionGroups(entry.printings, expansionGroupSize);
         state.groups = groups.length;
@@ -849,14 +1154,12 @@
               state.groupsSkipped += groups.length - index;
               break;
             }
-            // Thorough: one page per seller type (private, professional, powerseller). The three are
-            // disjoint and together hold the unfiltered page, so this gives up to 150 offers with
-            // plain page loads. (Cardmarket's own "Show more" is a POST to /AjaxAction/, which
-            // Cloudflare challenged after 4 requests on 2026-11-20.)
             for (const sellerType of splitBySellerType ? SELLER_TYPES : [undefined]) {
-              const query = { language, sellerCountries, minCondition: entry.minCondition, foil: entry.foil, signed: entry.signed, altered: entry.altered,
-                expansions: group.expansions, sellerType };
-              const key = ['card', entry.cardPath, language, sellerCountries.join('.'), entry.minCondition, entry.foil, entry.signed, entry.altered,
+              const query = {
+                language, sellerCountries, minCondition: entry.minCondition, foil: entry.foil, signed: entry.signed, altered: entry.altered,
+                expansions: group.expansions, sellerType,
+              };
+              const key = ['card', entry.cardPath, language, countriesKey, entry.minCondition, entry.foil, entry.signed, entry.altered,
                 (group.expansions || []).join('.'), sellerType ?? ''].join('|');
               const page = await cached(key, () => call('cardPage', entry, query));
               let kept = 0;
@@ -865,9 +1168,9 @@
               state.cardOffers += kept;
               state.skipped += page.skipped;
               state.pages += 1;
-              log({ type: 'card-page', card: entry.name, language, group: index + 1, groups: groups.length, expansions: group.expansions?.length ?? null,
-                sellerType: sellerType ?? null, offers: page.offers.length, kept, cheapestCents: page.offers[0]?.priceCents ?? null, outsideGroup: outside,
-                skipped: page.skipped, cached: !!page.fromCache });
+              log({ type: 'card-page', card: entry.name, game: entry.game || 'Magic', language, group: index + 1, groups: groups.length,
+                expansions: group.expansions?.length ?? null, sellerType: sellerType ?? null, offers: page.offers.length, kept,
+                cheapestCents: page.offers[0]?.priceCents ?? null, outsideGroup: outside, skipped: page.skipped, cached: !!page.fromCache });
             }
           }
         }
@@ -893,12 +1196,12 @@
       });
     }
 
-    // 2. Sellers that are cheap (up to the cutoff) for the most cards.
+    // 2. Sellers that are cheap (up to the cutoff) for the most items across all lists & games.
     const cheapCards = new Map();
     for (const entry of entries) {
       const { cutoffCents } = targets.get(entry.key);
       for (const offer of offers.get(entry.key).values()) {
-        if (cutoffCents !== null && offer.priceCents > cutoffCents) continue;
+        if (entry.kind !== 'product' && cutoffCents !== null && offer.priceCents > cutoffCents) continue;
         if (!cheapCards.has(offer.seller)) cheapCards.set(offer.seller, new Set());
         cheapCards.get(offer.seller).add(entry.key);
       }
@@ -907,7 +1210,6 @@
       .filter(row => row.cheapCards >= minSellerCards).sort((a, b) => b.cheapCards - a.cheapCards).slice(0, sellerLimit);
     log({ type: 'sellers-chosen', sellers: chosen, candidates: cheapCards.size });
 
-    // Results so far: used after each batch of sellers and at the end.
     const buildResults = () => entries.map(entry => {
       const state = cardState.get(entry.key);
       const sorted = [...offers.get(entry.key).values()].sort((a, b) => a.priceCents - b.priceCents);
@@ -918,30 +1220,58 @@
         if (seen >= entry.amount) fallback = sorted[i].priceCents;
       }
       return {
-        key: entry.key, name: entry.name, amount: entry.amount, targetCents: targetCents ?? fallback, cutoffCents,
+        key: entry.key, name: state.resolvedName || entry.name, amount: entry.amount,
+        kind: entry.kind || 'card', game: entry.game || state.resolvedMeta?.game || 'Magic',
+        listId: entry.listId ?? null, listName: entry.listName ?? null,
+        category: entry.category || state.resolvedMeta?.category || null,
+        productPath: entry.productPath || state.resolvedMeta?.path || null,
+        targetCents: targetCents ?? fallback, cutoffCents,
         verdict: state.status === 'blocked' ? 'blocked' : state.status === 'error' ? 'incomplete' : sorted.length ? 'read' : 'unavailable',
         cardOffers: state.cardOffers, sellerOffers: sorted.length - state.cardOffers, skippedRows: state.skipped, error: state.error,
         cardPages: state.pages, groups: state.groups, groupsSkipped: state.groupsSkipped,
-        printings: entry.printings.length, queries: [], offers: sorted,
+        printings: (entry.printings || []).length, queries: [], offers: sorted,
       };
     });
 
     const sellers = [];
     async function askSeller(row) {
-      const state = { ...row, pages: 0, rows: 0, total: null, matched: 0, status: 'pending', error: null };
+      const state = { ...row, location: sellerLocations.get(row.seller) || null, pages: 0, rows: 0, total: null, matched: 0, status: 'pending', error: null };
       sellers.push(state);
       try {
-        for (let pageNumber = 1; pageNumber <= maxSellerPages; pageNumber += 1) {
-          const page = await cached(['seller', row.seller, listId, pageNumber].join('|'), () => call('sellerWants', row.seller, listId, pageNumber));
-          state.pages += 1;
-          state.rows += page.offers.length;
-          state.total = page.total;
-          for (const offer of page.offers) {
-            for (const entry of byProduct.get(offer.idProduct) || []) if (keep(entry, { ...offer, seller: row.seller })) state.matched += 1;
+        let totalSum = 0;
+        let hasTotal = false;
+        let allComplete = true;
+        for (const list of activeLists) {
+          const listGame = list.game || 'Magic';
+          let listRows = 0;
+          let listTotal = null;
+          for (let pageNumber = 1; pageNumber <= maxSellerPages; pageNumber += 1) {
+            const cacheId = activeLists.length === 1 && listGame === 'Magic'
+              ? ['seller', row.seller, list.listId, pageNumber].join('|')
+              : ['seller', listGame, row.seller, list.listId, pageNumber].join('|');
+            const page = await cached(cacheId, () =>
+              activeLists.length === 1 && !lists
+                ? call('sellerWants', row.seller, list.listId, pageNumber)
+                : call('sellerWants', row.seller, list.listId, pageNumber, listGame));
+            state.pages += 1;
+            state.rows += page.offers.length;
+            listRows += page.offers.length;
+            if (page.total !== null) listTotal = page.total;
+            const loc = sellerLocations.get(row.seller) || null;
+            for (const offer of page.offers) {
+              const enriched = loc && !offer.location ? { ...offer, seller: row.seller, location: loc } : { ...offer, seller: row.seller };
+              const targetsForProduct = byProduct.get(`${listGame}:${offer.idProduct}`) || [];
+              for (const entry of targetsForProduct) {
+                if (entry.listId != null && String(entry.listId) !== String(list.listId)) continue;
+                if (keep(entry, enriched)) state.matched += 1;
+              }
+            }
+            if (!page.hasNext) break;
           }
-          if (!page.hasNext) break;
+          if (listTotal !== null) { totalSum += listTotal; hasTotal = true; if (listRows < listTotal) allComplete = false; }
         }
-        state.status = state.total === null || state.rows >= state.total ? 'complete' : 'partial';
+        state.total = hasTotal ? totalSum : null;
+        state.status = allComplete ? 'complete' : 'partial';
       } catch (error) {
         state.status = error instanceof BlockedError ? 'blocked' : 'error';
         state.error = error.message;
@@ -950,7 +1280,7 @@
       progress('sellers', sellers.length, Math.min(chosen.length, sellerLimit));
     }
 
-    if (listId) {
+    if (activeLists.length) {
       const sellerSlot = limiter(2);
       let next = 0;
       let lastCents = null;
@@ -961,12 +1291,12 @@
         next += batch.length;
         await Promise.all(batch.map(row => sellerSlot(() => askSeller(row))));
         if (!evaluate) break;
-        const cents = await evaluate(buildResults());
-        const saved = lastCents === null ? null : lastCents - cents;
-        batches.push({ asked: next, basketCents: cents, savedCents: saved });
-        log({ type: 'seller-batch', asked: next, basketCents: cents, savedCents: saved });
+        const centsVal = await evaluate(buildResults());
+        const saved = lastCents === null ? null : lastCents - centsVal;
+        batches.push({ asked: next, basketCents: centsVal, savedCents: saved });
+        log({ type: 'seller-batch', asked: next, basketCents: centsVal, savedCents: saved });
         if (saved !== null && saved < improvementCents) break;
-        lastCents = cents;
+        lastCents = centsVal;
       }
       stats.sellerBatches = batches;
     }
@@ -978,9 +1308,9 @@
       rule: { targetCopies, targetSellers, cutoffFactor, cutoffMarginCents, minSellers, sellerBatch, sellerLimit, improvementCents, minSellerCards } };
   }
 
-
   // Reads a Wants List page. Every entry keeps its own filters.
-  function parseWantsList(page) {
+  function parseWantsList(page, game = 'Magic') {
+    const cards = new RegExp(`/${game}/Cards/`);
     const rows = [...page.querySelectorAll('tbody tr')].filter(row => row.querySelector('td.name a'));
     if (!rows.length) throw new Error('No Wants List entries found on this page');
     const hiddenText = cell => cell?.querySelector('.visually-hidden')?.textContent.trim();
@@ -989,16 +1319,19 @@
       const link = row.querySelector('td.name a');
       const path = new URL(link.getAttribute('href'), 'https://www.cardmarket.com').pathname;
       const image = /\/(\d+)\/\d+\.\w+/.exec(row.querySelector('td.preview [data-bs-title]')?.getAttribute('data-bs-title') || '');
-      const [foil, signed, altered] = [...row.querySelectorAll('td.ternary-header')].map(cell => ternary(hiddenText(cell)));
+      const [first, signed, altered] = [...row.querySelectorAll('td.ternary-header')].map(cell => ternary(hiddenText(cell)));
+      const foil = game === 'Magic' ? first : 'any';
       const languages = [...row.querySelectorAll('td.languages [title], td.languages [data-bs-original-title]')]
         .map(tip).map(name => LANGUAGES[name]).filter(Boolean);
       const expansion = hiddenText(row.querySelector('td.expansion')) || row.querySelector('td.expansion')?.textContent.trim();
       return {
         key: row.querySelector('[data-id-want]')?.dataset.idWant || path,
+        game,
+        kind: 'card',
         name: link.textContent.trim(),
         amount: Number(row.querySelector('td.amount').dataset.amount),
-        anyPrinting: /\/Magic\/Cards\//.test(path),
-        cardPath: /\/Magic\/Cards\//.test(path) ? path : null,
+        anyPrinting: cards.test(path),
+        cardPath: cards.test(path) ? path : null,
         expansion,
         idProduct: image ? Number(image[1]) : null,
         languages: languages.length ? languages : Object.values(LANGUAGES),
@@ -1010,6 +1343,8 @@
   }
 
   root.CardmarketCollector = {
-    collect, collectBySellers, createRunner, expansionGroups, browserSite, RefusedError, parseWantsList, parseOfferRow, cents, RetryableError, BlockedError, StoppedError, LANGUAGES, CONDITIONS,
+    collect, collectBySellers, createRunner, expansionGroups, browserSite, RefusedError,
+    parseWantsList, parseWantsListName, parseWantsOverview, parseProductPageMeta, parseOfferRow, parseProductOfferRow,
+    cents, allCents, RetryableError, BlockedError, StoppedError, LANGUAGES, CONDITIONS, CACHE_MAX_AGE_MS,
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

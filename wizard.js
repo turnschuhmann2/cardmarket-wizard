@@ -1,15 +1,16 @@
 /*
  * Builds a basket from collected offers.
  *
- * 1. Seller ranking: repeatedly pick the seller whose cheapest set of still-open cards costs the
- *    least above market per card, counting that seller's shipping. Market is each card's target
- *    price, so cheap commons and expensive staples weigh the same, and sellers with many cheap
- *    listings win.
- * 2. Clean-up: move each card to the cheapest seller already in the basket, and drop sellers
- *    whose cards are cheaper elsewhere once shipping is counted.
- * 3. Coverage: sellers in order of their cost above market per card, with running totals, so
- *    "the first N sellers get X cards for Y" can be read off.
+ * 1. Seller ranking: repeatedly pick the seller whose cheapest set of still-open items costs the
+ *    least above market per item, counting that seller's shipping (per country, tracked-only, and
+ *    non-card product shipping rates).
+ * 2. Clean-up: move each item to the cheapest seller already in the basket, and drop sellers
+ *    whose items are cheaper elsewhere once shipping is counted.
+ * 3. Coverage: sellers in order of their cost above market per item, with running totals, so
+ *    "the first N sellers get X items for Y" can be read off.
  * 4. Top-up: offers the chosen sellers have above the cutoff can be priced as moves into the basket.
+ * 5. Scoped price limits: leave out cards above a limit for all cards, a single game, or a
+ *    specific Wants List, then recompute the whole combined basket from the cached offers.
  */
 (function (root) {
   'use strict';
@@ -25,19 +26,129 @@
     return methods.filter(method => !method.isVirtual).map(method => ({
       name: method.name, tracked: method.isTracked, maxWeight: method.maxWeight,
       maxValueCents: cents(method.maxValue), priceCents: cents(method.price),
+      isLetter: method.isLetter !== false,
     }));
   }
 
   // Cardmarket: a 20 g letter holds 4 cards, 50 g holds 17, 100 g holds 40.
-  const weightOf = cards => (cards <= 4 ? 20 : cards <= 17 ? 50 : cards <= 40 ? 100 : Math.ceil(cards * 2.5));
+  const weightOf = cards => (cards <= 0 ? 0 : cards <= 4 ? 20 : cards <= 17 ? 50 : cards <= 40 ? 100 : Math.ceil(cards * 2.5));
 
-  function shipping(table, cards, valueCents) {
+  function shippingByWeight(table, weightGrams, valueCents) {
     let best = null;
     for (const method of table) {
-      if (method.maxWeight >= weightOf(cards) && method.maxValueCents >= valueCents &&
+      if (method.maxWeight >= weightGrams && method.maxValueCents >= valueCents &&
           (!best || method.priceCents < best.priceCents)) best = method;
     }
     return best;
+  }
+
+  function shipping(table, cards, valueCents) {
+    return shippingByWeight(table, weightOf(cards), valueCents);
+  }
+
+  // Shipping for a mixed parcel (cards and/or non-card products like sleeves or deck boxes).
+  // Non-card offers carry `offer.shippingCents` read directly from their Cardmarket product page
+  // (which includes commercial sellers' Personal Shipping Methods, e.g. 1,48 EUR instead of 3,40 EUR).
+  function parcelShipping(table, items, valueCents) {
+    if (!table || !table.length) return null;
+    let cards = 0;
+    let products = 0;
+    let productFloorCents = null;
+    for (const item of items) {
+      if (item.unit?.kind === 'product' || item.kind === 'product') {
+        products += 1;
+        const quote = item.offer?.shippingCents;
+        if (typeof quote === 'number' && quote >= 0) {
+          productFloorCents = productFloorCents === null ? quote : Math.max(productFloorCents, quote);
+        }
+      } else {
+        cards += 1;
+      }
+    }
+    if (products === 0) return shipping(table, cards, valueCents);
+
+    const cardWeight = weightOf(cards);
+    // If no per-offer shipping quote was read, assume Maxibrief/parcel (~600 g per product).
+    if (productFloorCents === null) {
+      return shippingByWeight(table, cardWeight + products * 600, valueCents);
+    }
+
+    // Check what standard shipping method is required by total order value and combined weight.
+    const extraWeight = products > 1 ? products * 250 : 0;
+    const baseMethod = shippingByWeight(table, Math.max(20, cardWeight + extraWeight), valueCents);
+    if (!baseMethod) return null;
+
+    // If order value (or a tracked-only table) requires tracked shipping, price a tracked method
+    // that can actually hold a non-card product (at least 500 g).
+    if (baseMethod.tracked) {
+      const trackedForProduct = shippingByWeight(table, Math.max(500, cardWeight + products * 250), valueCents) || baseMethod;
+      if (trackedForProduct.priceCents >= productFloorCents) return trackedForProduct;
+    }
+
+    if (productFloorCents >= baseMethod.priceCents) {
+      const matched = table.find(m => m.priceCents === productFloorCents && m.maxValueCents >= valueCents);
+      return matched || {
+        name: 'Product shipping',
+        tracked: baseMethod.tracked,
+        maxWeight: Math.max(1000, baseMethod.maxWeight),
+        maxValueCents: Math.max(valueCents, baseMethod.maxValueCents),
+        priceCents: productFloorCents,
+      };
+    }
+    return baseMethod;
+  }
+
+  // Scoped price limits:
+  // scope: { type: 'all' } | { type: 'game', game: 'Magic'|'YuGiOh' } | { type: 'list', game, listId, label? }
+  function scopeKey(scope) {
+    if (!scope || scope.type === 'all') return 'all';
+    if (scope.type === 'game') return `game:${scope.game}`;
+    return `list:${scope.game || 'Magic'}:${scope.listId}`;
+  }
+
+  function matchesScope(result, scope) {
+    if (result.kind === 'product') return false;
+    if (!scope || scope.type === 'all') return true;
+    const game = result.game || 'Magic';
+    if (scope.type === 'game') return game === scope.game;
+    if (scope.type === 'list') return game === (scope.game || 'Magic') && String(result.listId ?? '') === String(scope.listId ?? '');
+    return false;
+  }
+
+  // Specificity: list (3) > game (2) > all (1). Allows e.g. "All <= 3 EUR, except YGO: no limit"
+  // or "YGO only <= 2 EUR" while keeping Magic untouched.
+  function effectiveLimitRule(result, rules = []) {
+    if (result.kind === 'product' || !rules.length) return null;
+    const rank = { all: 1, game: 2, list: 3 };
+    let winner = null;
+    for (const rule of rules) {
+      if (!matchesScope(result, rule)) continue;
+      if (!winner || (rank[rule.type] || 0) > (rank[winner.type] || 0)) winner = rule;
+    }
+    return winner;
+  }
+
+  function filterByLimits(results, rules = [], manualCuts = []) {
+    const manual = new Set(manualCuts);
+    const kept = [];
+    const leftOut = [];
+    const countsByScope = new Map();
+    for (const result of results) {
+      if (manual.has(result.key)) {
+        leftOut.push({ ...result, cutReason: 'manual', cutRule: null });
+        continue;
+      }
+      const rule = effectiveLimitRule(result, rules);
+      if (rule && rule.cents !== null && Number.isFinite(rule.cents) &&
+          result.targetCents !== null && result.targetCents > rule.cents) {
+        const key = scopeKey(rule);
+        countsByScope.set(key, (countsByScope.get(key) || 0) + (result.amount || 1));
+        leftOut.push({ ...result, cutReason: 'limit', cutRule: rule });
+        continue;
+      }
+      kept.push(result);
+    }
+    return { kept, leftOut, countsByScope };
   }
 
   // One unit is one wanted copy; a card wanted twice is two units.
@@ -45,7 +156,12 @@
     const units = [];
     for (const result of collection.results) {
       for (let copy = 0; copy < result.amount; copy += 1) {
-        units.push({ id: `${result.key}#${copy}`, key: result.key, name: result.name, targetCents: result.targetCents, verdict: result.verdict });
+        units.push({
+          id: `${result.key}#${copy}`, key: result.key, name: result.name,
+          targetCents: result.targetCents, verdict: result.verdict,
+          kind: result.kind || 'card', game: result.game || 'Magic',
+          listId: result.listId ?? null, listName: result.listName ?? null,
+        });
       }
     }
     return units;
@@ -53,16 +169,30 @@
 
   function offersBySeller(collection) {
     const sellers = new Map();
+    const sellerLocations = new Map();
     for (const result of collection.results) {
       for (const offer of result.offers) {
         if (!sellers.has(offer.seller)) sellers.set(offer.seller, new Map());
+        if (offer.location && !sellerLocations.has(offer.seller)) sellerLocations.set(offer.seller, offer.location);
         const byKey = sellers.get(offer.seller);
         if (!byKey.has(result.key)) byKey.set(result.key, []);
         byKey.get(result.key).push(offer);
       }
     }
     for (const byKey of sellers.values()) for (const list of byKey.values()) list.sort((a, b) => a.priceCents - b.priceCents);
-    return sellers;
+    return { sellers, sellerLocations };
+  }
+
+  // Normalises either a single shipping table (Method[]) or a per-country table map
+  // ({ default?: Method[], byLocation?: { [name]: Method[] } } or { [name]: Method[] }).
+  function normaliseTables(tableOrMap) {
+    if (Array.isArray(tableOrMap)) return { defaultTable: tableOrMap, byLocation: {} };
+    if (tableOrMap && typeof tableOrMap === 'object') {
+      const byLocation = tableOrMap.byLocation || tableOrMap;
+      const defaultTable = tableOrMap.default || Object.values(byLocation).find(Array.isArray) || [];
+      return { defaultTable, byLocation };
+    }
+    return { defaultTable: [], byLocation: {} };
   }
 
   // Seller-search strategies raced by optimise (see search() for what each setting does).
@@ -75,13 +205,24 @@
 
   // trackedOnly: sellers who may only ship tracked (learned from the cart: Cardmarket makes tracked
   // shipping mandatory for some sellers, e.g. new ones or ones with a high loss rate).
-  function createPlanner(collection, table, { trackedOnly = [] } = {}) {
+  function createPlanner(collection, tableOrMap, { trackedOnly = [] } = {}) {
+    const { defaultTable, byLocation } = normaliseTables(tableOrMap);
     const trackedSellers = new Set(trackedOnly);
-    const trackedTable = table.filter(method => method.tracked);
-    const tableFor = seller => (trackedSellers.has(seller) ? trackedTable : table);
+    const trackedCache = new WeakMap();
+    const onlyTracked = table => {
+      if (!trackedCache.has(table)) trackedCache.set(table, table.filter(method => method.tracked));
+      return trackedCache.get(table);
+    };
+
     const units = unitsOf(collection);
-    const sellers = offersBySeller(collection);
+    const { sellers, sellerLocations } = offersBySeller(collection);
     const unitById = new Map(units.map(unit => [unit.id, unit]));
+
+    const tableFor = seller => {
+      const location = sellerLocations.get(seller);
+      const base = (location && byLocation[location]) || defaultTable;
+      return trackedSellers.has(seller) ? onlyTracked(base) : base;
+    };
 
     // assignment: unit id -> { seller, offer }
     function parcels(assignment) {
@@ -92,8 +233,11 @@
       }
       return [...bySeller].map(([seller, items]) => {
         const itemsCents = items.reduce((sum, item) => sum + item.offer.priceCents, 0);
-        const method = shipping(tableFor(seller), items.length, itemsCents);
-        return { seller, items, itemsCents, method, shippingCents: method ? method.priceCents : Infinity };
+        const method = parcelShipping(tableFor(seller), items, itemsCents);
+        return {
+          seller, location: sellerLocations.get(seller) || null,
+          items, itemsCents, method, shippingCents: method ? method.priceCents : Infinity,
+        };
       });
     }
 
@@ -132,15 +276,18 @@
             const offer = cheapestCopy(seller, unit.key, local);
             if (!offer) continue;
             local.set(offer.idArticle, (local.get(offer.idArticle) || 0) + 1);
-            picks.push({ unitId, offer, extra: offer.priceCents - unit.targetCents });
+            picks.push({ unitId, unit, offer, extra: offer.priceCents - (unit.targetCents ?? offer.priceCents) });
           }
           picks.sort((a, b) => a.extra - b.extra);
           let extra = 0;
           let value = 0;
+          const sellerTable = tableFor(seller);
+          const prefix = [];
           picks.forEach((pick, index) => {
             extra += pick.extra;
             value += pick.offer.priceCents;
-            const method = shipping(tableFor(seller), index + 1, value);
+            prefix.push(pick);
+            const method = parcelShipping(sellerTable, prefix, value);
             if (!method) return;
             const perCard = (extra + method.priceCents) / (index + 1);
             if (!best || perCard < best.perCard) best = { seller, perCard, picks: picks.slice(0, index + 1) };
@@ -156,7 +303,7 @@
       return assignment;
     }
 
-    // Moves single cards between chosen sellers and drops sellers while the total goes down.
+    // Moves single items between chosen sellers and drops sellers while the total goes down.
     function improve(assignment) {
       let current = new Map(assignment);
       let cost = total(current);
@@ -195,13 +342,20 @@
 
     function describe(assignment) {
       const list = parcels(assignment).map(parcel => {
-        const extraCents = parcel.items.reduce((sum, item) => sum + item.offer.priceCents - item.unit.targetCents, 0) + parcel.shippingCents;
+        const extraCents = parcel.items.reduce((sum, item) => sum + item.offer.priceCents - (item.unit.targetCents ?? item.offer.priceCents), 0) + parcel.shippingCents;
+        const games = [...new Set(parcel.items.map(item => item.unit.game).filter(Boolean))];
+        const hasProducts = parcel.items.some(item => item.unit.kind === 'product');
         return {
-          seller: parcel.seller, itemsCents: parcel.itemsCents, shippingCents: parcel.shippingCents,
+          seller: parcel.seller, location: parcel.location, games, hasProducts,
+          itemsCents: parcel.itemsCents, shippingCents: parcel.shippingCents,
           method: parcel.method?.name ?? null, extraPerCardCents: Math.round(extraCents / parcel.items.length),
           items: parcel.items.map(({ unit, offer }) => ({
-            key: unit.key, name: unit.name, idArticle: offer.idArticle, idProduct: offer.idProduct, foil: !!offer.foil,
-            priceCents: offer.priceCents, targetCents: unit.targetCents, aboveMarket: offer.priceCents > unit.targetCents,
+            key: unit.key, name: unit.name, kind: unit.kind, game: unit.game,
+            listId: unit.listId, listName: unit.listName,
+            idArticle: offer.idArticle, idProduct: offer.idProduct, foil: !!offer.foil,
+            priceCents: offer.priceCents, targetCents: unit.targetCents,
+            aboveMarket: unit.targetCents !== null && offer.priceCents > unit.targetCents,
+            offerShippingCents: offer.shippingCents ?? null,
           })).sort((a, b) => a.name.localeCompare(b.name)),
         };
       }).sort((a, b) => a.extraPerCardCents - b.extraPerCardCents);
@@ -218,7 +372,7 @@
         shippingCents: list.reduce((sum, parcel) => sum + parcel.shippingCents, 0),
         // Not collected (the run stopped first) is not the same as nobody selling it.
         missing: units.filter(unit => !assigned.has(unit.id)).map(unit => ({
-          key: unit.key, name: unit.name,
+          key: unit.key, name: unit.name, kind: unit.kind, game: unit.game, listId: unit.listId, listName: unit.listName,
           reason: unit.verdict === 'blocked' ? 'not collected' : unit.verdict === 'incomplete' ? 'not fully collected' : 'no offer',
         })),
         assignment,
@@ -238,7 +392,7 @@
           if ([...used(trial)].some(([idArticle, count]) => idArticle === offer.idArticle && count > offer.quantity)) continue;
           candidates.push({
             unitId: unit.id, name: unit.name, seller: offer.seller, offer, targetCents: unit.targetCents,
-            aboveMarket: offer.priceCents > unit.targetCents, replaces: current ? current.seller : null,
+            aboveMarket: unit.targetCents !== null && offer.priceCents > unit.targetCents, replaces: current ? current.seller : null,
             deltaCents: total(trial) - base,
           });
           break;
@@ -251,21 +405,27 @@
       return describe(new Map(basket.assignment).set(candidate.unitId, { seller: candidate.seller, offer: candidate.offer }));
     }
 
-    // Sellers with the most wanted cards up to the cutoff, and how many of those at or below target.
+    // Sellers with the most wanted items up to the cutoff, and how many of those at or below target.
     function overlap(limit = 15) {
       return [...sellers].map(([seller, byKey]) => {
         let atTarget = 0;
         let cheapestCents = 0;
+        const games = new Set();
         for (const [key, list] of byKey) {
           const result = collection.results.find(candidate => candidate.key === key);
-          if (list[0].priceCents <= result.targetCents) atTarget += 1;
+          if (result.game) games.add(result.game);
+          if (result.targetCents !== null && list[0].priceCents <= result.targetCents) atTarget += 1;
           cheapestCents += list[0].priceCents;
         }
-        return { seller, cards: byKey.size, atTarget, cheapestCents };
+        const row = { seller, cards: byKey.size, atTarget, cheapestCents };
+        const loc = sellerLocations.get(seller);
+        if (loc) row.location = loc;
+        if (games.size) row.games = [...games];
+        return row;
       }).sort((a, b) => b.cards - a.cards || b.atTarget - a.atTarget || a.cheapestCents - b.cheapestCents).slice(0, limit);
     }
 
-    // Each card from the cheapest copy among the given sellers, in wanted-list order.
+    // Each item from the cheapest copy among the given sellers, in wanted-list order.
     function assignWithin(chosen) {
       const assignment = new Map();
       const taken = new Map();
@@ -282,8 +442,8 @@
       return assignment;
     }
 
-    // A card nobody among the chosen sellers has counts as very expensive, so a seller set that
-    // leaves cards out never wins.
+    // An item nobody among the chosen sellers has counts as very expensive, so a seller set that
+    // leaves items out never wins.
     const MISSING_CENTS = 100000;
     const costOf = chosen => {
       const assignment = assignWithin(chosen);
@@ -302,21 +462,11 @@
 
     const pause = () => new Promise(resolve => setTimeout(resolve, 0));
 
-    /*
-     * Searches over which sellers to buy from: drop a seller, add one, or swap one for another,
-     * whenever that lowers the total (items plus every parcel's shipping). When no single move
-     * helps, it drops `shake` random sellers and searches again, keeping the best set found,
-     * until the deadline. Sellers are tried in order of how much they could save, `breadth` per
-     * pass. `start: 'empty'` builds the set from nothing instead of from the quick basket.
-     */
     async function search(basket, { seed = 1, shake = 3, breadth = 150, start = 'basket' }, deadline) {
       const next = random(seed);
       const candidates = [...sellers.keys()];
       const timeLeft = () => Date.now() < deadline;
 
-      // Only a seller with some card cheaper than what the basket pays for it can lower the total;
-      // any other seller only adds shipping (on the 114-card list 1,756 of 3,131 sellers were
-      // cheaper somewhere, most by a few cents on a single card).
       function helpful(assignment) {
         const paid = new Map();
         for (const unit of units) {
@@ -379,11 +529,6 @@
       return best;
     }
 
-    /*
-     * Runs several search strategies, each for an equal share of timeMs, and keeps the cheapest
-     * basket. On the 114-card list of 2026-11-20 different strategies ended a few cents apart
-     * (76,04 and 76,09 EUR from 78,48 EUR), so racing them is cheap insurance.
-     */
     async function optimise(basket, { timeMs = 10000, strategies = STRATEGIES, onProgress = () => {} } = {}) {
       const initialCents = total(basket.assignment) + (units.length - basket.assignment.size) * MISSING_CENTS;
       const share = timeMs / strategies.length;
@@ -418,15 +563,6 @@
       return Number.isFinite(result.totalCents) ? result : null;
     }
 
-    /*
-     * Cards worth buying elsewhere: leaving a card out can save more than its price when it forces
-     * a seller or a dearer parcel. Each round tries every card still in the basket (removing all its
-     * copies), re-routes the rest with the clean-up step for the most promising `shortlist`, and
-     * keeps the cut that saves most beyond the card's market price. Stops after maxCuts (5 % of the
-     * copies by default) or when the best cut saves less than minExtraCents beyond its price.
-     * On the 114-card list of 2026-11-20 three cuts saved 6,08 EUR, 2,23 EUR of it beyond the
-     * cards' market value.
-     */
     function recommendCuts(basket, { maxCuts = Math.max(1, Math.round(units.length * 0.05)), minExtraCents = 20, shortlist = 15 } = {}) {
       let assignment = new Map(basket.assignment);
       let current = total(assignment);
@@ -445,8 +581,11 @@
           if (!best || extra > best.extra) best = { key, rest, cents, extra };
         }
         if (!best || best.extra < minExtraCents) break;
-        const name = units.find(unit => unit.key === best.key).name;
-        cuts.push({ key: best.key, name, marketCents: marketOf(best.key), savedCents: current - best.cents, extraCents: best.extra, basketCents: best.cents });
+        const unit = units.find(candidate => candidate.key === best.key);
+        cuts.push({
+          key: best.key, name: unit.name, game: unit.game, listName: unit.listName, kind: unit.kind,
+          marketCents: marketOf(best.key), savedCents: current - best.cents, extraCents: best.extra, basketCents: best.cents,
+        });
         assignment = best.rest;
         current = best.cents;
       }
@@ -456,5 +595,8 @@
     return { basket: () => describe(improve(rank())), optimise, revalidate, recommendCuts, topUp, apply, overlap };
   }
 
-  root.CardmarketWizard = { createPlanner, parseShippingTable, shipping, weightOf, STRATEGIES };
+  root.CardmarketWizard = {
+    createPlanner, parseShippingTable, shipping, shippingByWeight, parcelShipping, weightOf,
+    scopeKey, matchesScope, effectiveLimitRule, filterByLimits, STRATEGIES,
+  };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

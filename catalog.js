@@ -1,6 +1,6 @@
 /*
  * Builds the printing list for each Wants List entry from Cardmarket's public exports:
- * the Magic singles catalogue (idProduct -> idMetacard) and the daily price guide (lowest
+ * the singles catalogue of a game (idProduct -> idMetacard) and the daily price guide (lowest
  * listed price per printing, over every language, condition and seller country).
  */
 (function (root) {

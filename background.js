@@ -1,43 +1,159 @@
-// Loads Cardmarket's public exports (no CORS, so they are fetched here) and plans printings.
+// Service worker: opens the full-page Better Wizard app, routes Cardmarket requests through a
+// signed-in Cardmarket tab, caches Cardmarket catalogues/shipping tables, and resolves Scryfall ids.
 importScripts('catalog.js');
 
 const EXPORTS = 'https://downloads.s3.cardmarket.com/productCatalog';
-const MAX_AGE_MS = 20 * 60 * 60 * 1000;
-let indexPromise = null;
+const CATALOG_MAX_AGE_MS = 20 * 60 * 60 * 1000;
+const SHIPPING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const indexPromises = {};
+let bridgeTabPromise = null;
 
-async function loadIndex() {
-  const { catalogueIndex } = await chrome.storage.local.get('catalogueIndex');
-  if (catalogueIndex?.version === CardmarketCatalog.INDEX_VERSION && Date.now() - catalogueIndex.fetchedAt < MAX_AGE_MS) return catalogueIndex;
+// Cardmarket's game ids in the public export file names.
+const GAME_IDS = { Magic: 1, YuGiOh: 3 };
+
+// Cardmarket's country ids & names (from help.cardmarket.com/api/countries).
+const COUNTRIES = [
+  [1, 'Austria'], [2, 'Belgium'], [3, 'Bulgaria'], [35, 'Croatia'], [5, 'Cyprus'], [6, 'Czech Republic'],
+  [8, 'Denmark'], [9, 'Estonia'], [11, 'Finland'], [12, 'France'], [7, 'Germany'], [14, 'Greece'],
+  [15, 'Hungary'], [37, 'Iceland'], [16, 'Ireland'], [17, 'Italy'], [36, 'Japan'], [21, 'Latvia'],
+  [18, 'Liechtenstein'], [19, 'Lithuania'], [20, 'Luxembourg'], [22, 'Malta'], [23, 'Netherlands'],
+  [24, 'Norway'], [25, 'Poland'], [26, 'Portugal'], [27, 'Romania'], [29, 'Singapore'], [31, 'Slovakia'],
+  [30, 'Slovenia'], [10, 'Spain'], [28, 'Sweden'], [4, 'Switzerland'], [13, 'United Kingdom'],
+];
+const COUNTRY_NAME_BY_ID = Object.fromEntries(COUNTRIES);
+
+async function openOrFocusApp(params = {}) {
+  const baseUrl = chrome.runtime.getURL('app.html');
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
+  }
+  const targetUrl = qs.toString() ? `${baseUrl}?${qs}` : baseUrl;
+  const existing = await chrome.tabs.query({ url: `${baseUrl}*` });
+  if (existing.length) {
+    const tab = existing[0];
+    await chrome.tabs.update(tab.id, { active: true });
+    if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+    if (Object.keys(params).length) {
+      chrome.tabs.sendMessage(tab.id, { type: 'app-context', params }).catch(() => {});
+    }
+    return tab;
+  }
+  return chrome.tabs.create({ url: targetUrl });
+}
+
+chrome.action.onClicked.addListener(() => {
+  openOrFocusApp();
+});
+
+async function pingTab(tabId) {
+  try {
+    const res = await chrome.tabs.sendMessage(tabId, { type: 'cm-ping' });
+    return res?.ok ? res : null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForTabComplete(tabId, timeoutMs = 20000) {
+  const current = await chrome.tabs.get(tabId).catch(() => null);
+  if (current?.status === 'complete') return;
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(onUpdate);
+      resolve();
+    }, timeoutMs);
+    const onUpdate = (id, info) => {
+      if (id === tabId && info.status === 'complete') {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(onUpdate);
+        resolve();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(onUpdate);
+  });
+}
+
+async function getCardmarketTab() {
+  const tabs = await chrome.tabs.query({ url: 'https://www.cardmarket.com/*' });
+  // Prefer an already-responsive tab (especially one with a CSRF token).
+  let fallback = null;
+  for (const tab of tabs) {
+    if (tab.discarded || tab.id == null) continue;
+    const ping = await pingTab(tab.id);
+    if (ping) {
+      if (ping.hasToken) return tab.id;
+      fallback ??= tab.id;
+    }
+  }
+  if (fallback != null) return fallback;
+
+  // No responsive Cardmarket tab found: open one in the background once.
+  if (!bridgeTabPromise) {
+    bridgeTabPromise = (async () => {
+      const created = await chrome.tabs.create({ url: 'https://www.cardmarket.com/en/Magic', active: false });
+      await waitForTabComplete(created.id);
+      // Give document_idle content script a brief beat to register.
+      for (let i = 0; i < 10; i += 1) {
+        if (await pingTab(created.id)) return created.id;
+        await new Promise(r => setTimeout(r, 250));
+      }
+      return created.id;
+    })().finally(() => { bridgeTabPromise = null; });
+  }
+  return bridgeTabPromise;
+}
+
+async function loadIndex(game) {
+  const id = GAME_IDS[game] || 1;
+  const key = `catalogueIndex:${id}`;
+  const { [key]: catalogueIndex } = await chrome.storage.local.get(key);
+  if (catalogueIndex?.version === CardmarketCatalog.INDEX_VERSION && Date.now() - catalogueIndex.fetchedAt < CATALOG_MAX_AGE_MS) {
+    return catalogueIndex;
+  }
   const [catalogue, priceGuide] = await Promise.all([
-    fetch(`${EXPORTS}/productList/products_singles_1.json`).then(response => response.json()),
-    fetch(`${EXPORTS}/priceGuide/price_guide_1.json`).then(response => response.json()),
+    fetch(`${EXPORTS}/productList/products_singles_${id}.json`).then(r => r.json()),
+    fetch(`${EXPORTS}/priceGuide/price_guide_${id}.json`).then(r => r.json()),
   ]);
   const index = { ...CardmarketCatalog.indexCatalogue(catalogue, priceGuide), fetchedAt: Date.now() };
-  await chrome.storage.local.set({ catalogueIndex: index });
+  await chrome.storage.local.set({ [key]: index });
+  await chrome.storage.local.remove('catalogueIndex');
   return index;
 }
 
-chrome.runtime.onMessage.addListener((message, sender, reply) => {
-  if (message.type === 'shipping') {
-    fetch(`https://help.cardmarket.com/api/shippingCosts?locale=en&fromCountry=${message.from}&toCountry=${message.to}`)
-      .then(response => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
-      .then(methods => reply({ methods }), error => reply({ error: String(error) }));
-    return true;
+async function fetchShipping(from, to) {
+  const key = `ship:${from}:${to}`;
+  const { [key]: cached } = await chrome.storage.local.get(key);
+  if (cached && Date.now() - cached.at < SHIPPING_MAX_AGE_MS && Array.isArray(cached.methods)) {
+    return cached.methods;
   }
-  if (message.type === 'printings') {
-    printings(message.ids).then(found => reply({ found }), error => reply({ error: String(error) }));
-    return true;
-  }
-  if (message.type !== 'plan') return false;
-  indexPromise = indexPromise || loadIndex().finally(() => { indexPromise = null; });
-  indexPromise
-    .then(index => reply({ plan: CardmarketCatalog.planEntries(message.wants, index) }))
-    .catch(error => reply({ error: String(error) }));
-  return true;
-});
+  const response = await fetch(`https://help.cardmarket.com/api/shippingCosts?locale=en&fromCountry=${from}&toCountry=${to}`);
+  if (!response.ok) throw new Error(`HTTP ${response.status} for shipping ${from}->${to}`);
+  const methods = await response.json();
+  await chrome.storage.local.set({ [key]: { at: Date.now(), methods } });
+  return methods;
+}
 
-// Set code and collector number of Cardmarket printings, from Scryfall (which records each card's
-// Cardmarket product id), for exports such as Archidekt. Cached; Scryfall asks for gaps between requests.
+async function fetchShippingMulti(fromList, to) {
+  const unique = [...new Set(fromList.map(Number).filter(Boolean))];
+  const tables = {};
+  const queue = [...unique];
+  const workers = Array.from({ length: Math.min(6, queue.length) }, async () => {
+    while (queue.length) {
+      const from = queue.shift();
+      try {
+        const methods = await fetchShipping(from, to);
+        const name = COUNTRY_NAME_BY_ID[from] || String(from);
+        tables[name] = methods;
+      } catch (error) {
+        // Skip unsupported pairs rather than failing the whole European batch.
+      }
+    }
+  });
+  await Promise.all(workers);
+  return tables;
+}
+
 async function printings(ids) {
   const { scryfallPrintings: known = {} } = await chrome.storage.local.get('scryfallPrintings');
   for (const id of ids) {
@@ -56,3 +172,66 @@ async function printings(ids) {
   await chrome.storage.local.set({ scryfallPrintings: known });
   return Object.fromEntries(ids.map(id => [id, known[id] ?? null]));
 }
+
+chrome.runtime.onMessage.addListener((message, sender, reply) => {
+  if (!message || typeof message !== 'object') return false;
+
+  if (message.type === 'open-app') {
+    openOrFocusApp(message.params || {}).then(() => reply({ ok: true }), error => reply({ error: String(error) }));
+    return true;
+  }
+
+  if (message.type === 'cm-fetch') {
+    (async () => {
+      try {
+        const tabId = await getCardmarketTab();
+        const result = await chrome.tabs.sendMessage(tabId, message);
+        reply(result);
+      } catch (error) {
+        reply({ error: error?.message || String(error) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === 'cm-token') {
+    (async () => {
+      try {
+        const tabId = await getCardmarketTab();
+        const result = await chrome.tabs.sendMessage(tabId, { type: 'cm-token' });
+        reply(result || { token: null });
+      } catch {
+        reply({ token: null });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === 'shipping') {
+    fetchShipping(message.from, message.to)
+      .then(methods => reply({ methods }), error => reply({ error: String(error) }));
+    return true;
+  }
+
+  if (message.type === 'shipping-multi') {
+    fetchShippingMulti(message.fromList || [], message.to)
+      .then(tables => reply({ tables }), error => reply({ error: String(error) }));
+    return true;
+  }
+
+  if (message.type === 'printings') {
+    printings(message.ids).then(found => reply({ found }), error => reply({ error: String(error) }));
+    return true;
+  }
+
+  if (message.type === 'plan') {
+    const game = message.game || 'Magic';
+    indexPromises[game] = indexPromises[game] || loadIndex(game).finally(() => { delete indexPromises[game]; });
+    indexPromises[game]
+      .then(index => reply({ plan: CardmarketCatalog.planEntries(message.wants, index) }))
+      .catch(error => reply({ error: String(error) }));
+    return true;
+  }
+
+  return false;
+});
