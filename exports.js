@@ -11,6 +11,7 @@
 
   function groupKeyFor(entry) {
     if (entry.kind === 'product') return 'products';
+    if (entry.kind === 'token') return `token:${entry.listName || 'Default'}`;
     const game = entry.game || 'Magic';
     if (entry.listId != null && entry.listId !== '') return `list:${game}:${entry.listId}`;
     if (entry.listName) return `name:${game}:${entry.listName}`;
@@ -19,6 +20,9 @@
 
   function baseGroupLabel(entry) {
     if (entry.kind === 'product') return 'Extra Products';
+    if (entry.kind === 'token') {
+      return entry.listName && entry.listName !== 'Default' ? `Tokens: ${entry.listName}` : 'Magic Tokens';
+    }
     const game = entry.game || 'Magic';
     if (entry.listName) return entry.listName;
     if (entry.listId != null && entry.listId !== '') return `${gameLabel(game)} Wants #${entry.listId}`;
@@ -69,11 +73,15 @@
     }));
   }
 
-  // Groups entries by Wants List (and Extra Products for plain export).
-  // For 'archidekt', only Magic non-product cards are included.
+  function isArchidektEligible(entry) {
+    return (entry.game || 'Magic') === 'Magic' && entry.kind !== 'product' && entry.kind !== 'token';
+  }
+
+  // Groups entries by Wants List (and Extra Products / Tokens for plain export).
+  // For 'archidekt', only Magic non-product, non-token cards are included.
   function groupExportEntries(entries, format = 'archidekt') {
     const eligible = format === 'archidekt'
-      ? (entries || []).filter(e => (e.game || 'Magic') === 'Magic' && e.kind !== 'product')
+      ? (entries || []).filter(isArchidektEligible)
       : (entries || []);
 
     const groups = new Map();
@@ -117,11 +125,11 @@
   }
 
   function sanitizeCategory(text) {
-    return String(text || '').replace(/[[\]]/g, '').replace(/\s+/g, ' ').trim();
+    return String(text || '').replace(/[\[\]]/g, '').replace(/\s+/g, ' ').trim();
   }
 
   function formatArchidektExport(entries, foundPrintings = {}, { categoryBy = 'seller' } = {}) {
-    const magicOnly = (entries || []).filter(e => (e.game || 'Magic') === 'Magic' && e.kind !== 'product');
+    const magicOnly = (entries || []).filter(isArchidektEligible);
     const labelByKey = categoryBy === 'list'
       ? new Map(groupExportEntries(magicOnly, 'archidekt').map(g => [g.key, g.label]))
       : null;
@@ -174,12 +182,18 @@
       for (const g of groupExportEntries(list, 'plain')) {
         const counts = new Map();
         for (const e of g.entries) counts.set(e.name, (counts.get(e.name) || 0) + (e.quantity || 1));
-        const prefix = g.kind === 'product' ? g.label : `${g.label}${g.game ? ` (${gameLabel(g.game)})` : ''}`;
+        const prefix = (g.kind === 'product' || g.kind === 'token')
+          ? g.label
+          : `${g.label}${g.game ? ` (${gameLabel(g.game)})` : ''}`;
         groups.set(prefix, counts);
       }
     } else {
       for (const e of list) {
-        const g = e.kind === 'product' ? 'Extra Products' : gameLabel(e.game || 'Magic');
+        const g = e.kind === 'product'
+          ? 'Extra Products'
+          : e.kind === 'token'
+            ? baseGroupLabel(e)
+            : gameLabel(e.game || 'Magic');
         if (!groups.has(g)) groups.set(g, new Map());
         const m = groups.get(g);
         m.set(e.name, (m.get(e.name) || 0) + (e.quantity || 1));

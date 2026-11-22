@@ -250,5 +250,18 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     return true;
   }
 
+  if (message.type === 'token-catalog') {
+    const game = message.game || 'Magic';
+    indexPromises[game] = indexPromises[game] || loadIndex(game).finally(() => { delete indexPromises[game]; });
+    indexPromises[game]
+      .then(index => reply({
+        tokens: index.tokens || [],
+        catalogueCreatedAt: index.catalogueCreatedAt,
+        priceGuideCreatedAt: index.priceGuideCreatedAt,
+      }))
+      .catch(error => reply({ error: String(error) }));
+    return true;
+  }
+
   return false;
 });

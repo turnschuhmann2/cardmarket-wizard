@@ -2,26 +2,59 @@
  * Builds the printing list for each Wants List entry from Cardmarket's public exports:
  * the singles catalogue of a game (idProduct -> idMetacard) and the daily price guide (lowest
  * listed price per printing, over every language, condition and seller country).
+ * Also extracts a compact token catalogue for Magic's Token Finder feature.
  */
 (function (root) {
   'use strict';
 
   // Bump when the index layout changes, so a cached index from an older version is rebuilt.
-  const INDEX_VERSION = 2;
+  const INDEX_VERSION = 3;
   const toCents = value => (typeof value === 'number' && value > 0 ? Math.round(value * 100) : null);
+
+  const EXACT_HELPER_FACES = new Set([
+    'the monarch',
+    'the initiative',
+    "city's blessing",
+    'day',
+    'night',
+    'the ring',
+    'undercity',
+    'lost mine of phandelver',
+    'dungeon of the mad mage',
+    'tomb of annihilation',
+    'radiation',
+    'poison counter',
+    'energy reserve',
+    'experience counter',
+    'helper card',
+  ]);
+
+  function isTokenProductName(name) {
+    const text = String(name || '').trim();
+    if (!text) return false;
+    if (/\b(?:Token|Emblem)\b/i.test(text)) return true;
+    const faces = text.split(/\s+\/\/?\s+/).map(part => part.replace(/\s*\(V\.\d+\)\s*$/i, '').trim().toLowerCase());
+    return faces.length > 0 && faces.every(face => EXACT_HELPER_FACES.has(face));
+  }
 
   function indexCatalogue(catalogue, priceGuide) {
     const guide = new Map(priceGuide.priceGuides.map(row => [row.idProduct, row]));
     const metacards = {};
     const productMetacard = {};
+    const tokens = [];
     for (const product of catalogue.products) {
       const row = guide.get(product.idProduct) || {};
+      const low = toCents(row.low);
+      const lowFoil = toCents(row['low-foil']);
       productMetacard[product.idProduct] = product.idMetacard;
-      (metacards[product.idMetacard] ||= []).push([product.idProduct, toCents(row.low), toCents(row['low-foil']), product.idExpansion]);
+      (metacards[product.idMetacard] ||= []).push([product.idProduct, low, lowFoil, product.idExpansion]);
+      if (isTokenProductName(product.name)) {
+        tokens.push([product.idProduct, product.name, low, lowFoil, product.idExpansion ?? null, product.idMetacard ?? null]);
+      }
     }
     return {
       version: INDEX_VERSION, catalogueCreatedAt: catalogue.createdAt, priceGuideCreatedAt: priceGuide.createdAt,
-      metacards, productMetacard,
+      metacards, productMetacard, tokens,
     };
   }
 
@@ -61,5 +94,5 @@
     return { entries, warnings, priceGuideCreatedAt: index.priceGuideCreatedAt, catalogueCreatedAt: index.catalogueCreatedAt };
   }
 
-  root.CardmarketCatalog = { indexCatalogue, planEntries, INDEX_VERSION };
+  root.CardmarketCatalog = { indexCatalogue, planEntries, isTokenProductName, INDEX_VERSION };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

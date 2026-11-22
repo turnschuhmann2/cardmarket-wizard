@@ -5,15 +5,19 @@
   'use strict';
 
   const {
-    collect, collectBySellers, createRunner, browserSite, BlockedError, RetryableError, RefusedError, CACHE_MAX_AGE_MS,
+    collect, collectBySellers, collectSellerTokens, createRunner, browserSite, BlockedError, RetryableError, RefusedError, CACHE_MAX_AGE_MS,
   } = globalThis.CardmarketCollector;
   const {
-    parseShippingTable, scopeKey, filterByLimits, matchesScope,
+    parseShippingTable, parcelShipping, scopeKey, filterByLimits, matchesScope,
   } = globalThis.CardmarketWizard;
   const {
     collectBasketEntries, collectLeftOutEntries, groupExportEntries,
     formatArchidektExport, formatPlainExport, safeExportFilename,
   } = globalThis.CardmarketExport;
+  const {
+    buildTokenCatalog, parseTokenListText, matchTokenDecks, optimizeTokens,
+    mergeTokensIntoBasket, formatProxyListText,
+  } = globalThis.CardmarketTokens;
 
   const COUNTRIES = [
     [1, 'Austria'], [2, 'Belgium'], [3, 'Bulgaria'], [35, 'Croatia'], [5, 'Cyprus'], [6, 'Czech Republic'],
@@ -135,12 +139,30 @@
     optimiseJobId: 0,
     optimising: false,
     fetching: false,
+    fetchingTokens: false,
     carting: false,
     controller: null,
     runLog: [],
     currentTables: null,
     savedRuns: [],
+    tokensText: '',
+    tokenDeckOptions: {},
+    tokenSettings: { maxPriceCents: 20, minCondition: 5, language: null, foil: 'N' },
+    tokenCatalog: null,
+    tokenCatalogLoading: null,
+    tokenMatchPlan: null,
+    sellerTokenOffers: {},
+    tokenResult: null,
+    includeTokensInBasket: true,
   };
+
+  function activeBasket() {
+    if (!state.basket) return null;
+    if (state.includeTokensInBasket && state.tokenResult?.assignments?.length) {
+      return mergeTokensIntoBasket(state.basket, state.tokenResult);
+    }
+    return state.basket;
+  }
 
   const record = event => state.runLog.push({ t: new Date().toISOString(), ...event });
 
@@ -492,23 +514,28 @@
 
   // ---- Progress & Busy Controls ----
   function syncBusyUI() {
-    const working = state.fetching || state.carting;
+    const working = state.fetching || state.fetchingTokens || state.carting;
     const computeBtn = $('btnCompute');
     computeBtn.disabled = working;
     $('btnRefetch').disabled = working;
     $('btnOpenRun').disabled = working;
     $('importFile').disabled = working;
     $('btnBuy').disabled = working || state.optimising;
+    const findTokensBtn = $('btnFindTokens');
+    if (findTokensBtn) findTokensBtn.disabled = working || state.optimising || !state.basket;
+    const reoptTokensBtn = $('btnReoptTokens');
+    if (reoptTokensBtn) reoptTokensBtn.disabled = working || state.optimising || !state.basket;
     $('btnStop').hidden = !(working && state.controller);
     computeBtn.querySelector('.btn-spinner').hidden = !(working || state.optimising);
     $('btnComputeLabel').textContent = state.fetching ? 'Fetching offers…'
-      : state.carting ? 'Adding to cart…'
-        : state.optimising ? 'Optimising…' : 'Compute Basket';
+      : state.fetchingTokens ? 'Finding tokens…'
+        : state.carting ? 'Adding to cart…'
+          : state.optimising ? 'Optimising…' : 'Compute Basket';
   }
 
   // Recompute triggers must not overlap a fetch or cart run.
   function workInProgress() {
-    if (!state.fetching && !state.carting) return false;
+    if (!state.fetching && !state.fetchingTokens && !state.carting) return false;
     toast('Wait for the current fetch or cart run to finish first.', 'error');
     return true;
   }
@@ -797,21 +824,26 @@
 
   // ---- UI Rendering: Main Basket & Tabs ----
   function renderKpis(optimising = false, note = '') {
-    const b = state.basket;
+    const b = activeBasket();
     if (!b) return;
-    const covered = b.curve.at(-1)?.cards || 0;
+    const tokenCount = b.tokenStats?.physicalTokensBought || 0;
+    const covered = (b.curve.at(-1)?.cards || 0) - tokenCount;
     const totalWanted = covered + b.missing.length;
     const itemsCents = b.totalCents - b.shippingCents;
-    const crossCount = b.parcels.filter(p => (p.games?.length || 0) > 1 || p.hasProducts).length;
+    const crossCount = b.parcels.filter(p => (p.games?.length || 0) > 1 || p.hasProducts || p.hasTokens).length;
+    const tokenNote = tokenCount ? `Incl. +${tokenCount} token${tokenCount === 1 ? '' : 's'} (${euros(b.tokenStats.totalAddedCents)})` : '';
+    const subNote = optimising ? 'Searching for cheaper seller combos…'
+      : note && tokenNote ? `${note} · ${tokenNote}`
+        : note || tokenNote || 'Optimised total';
 
     $('kpiTotal').textContent = euros(b.totalCents);
-    $('kpiTotalSub').className = `kpi-sub ${note ? 'good' : ''}`;
-    $('kpiTotalSub').textContent = optimising ? 'Searching for cheaper seller combos…' : note || 'Optimised total';
+    $('kpiTotalSub').className = `kpi-sub ${(note || tokenNote) ? 'good' : ''}`;
+    $('kpiTotalSub').textContent = subNote;
     $('kpiSplit').textContent = `${euros(itemsCents)} + ${euros(b.shippingCents)}`;
     $('kpiSplitSub').textContent = `${b.totalCents ? Math.round((b.shippingCents / b.totalCents) * 100) : 0}% shipping`;
     $('kpiSellers').textContent = `${b.parcels.length}`;
-    $('kpiSellersSub').textContent = crossCount ? `${crossCount} combined multi-game/product parcel${crossCount > 1 ? 's' : ''}` : 'Optimized seller count';
-    $('kpiItems').textContent = `${covered} / ${totalWanted}`;
+    $('kpiSellersSub').textContent = crossCount ? `${crossCount} combined parcel${crossCount > 1 ? 's' : ''}` : 'Optimized seller count';
+    $('kpiItems').textContent = tokenCount ? `${covered}/${totalWanted} +${tokenCount}T` : `${covered} / ${totalWanted}`;
     $('kpiItemsSub').textContent = b.missing.length ? `${b.missing.length} unavailable` : '100% covered';
     $('tabCountSellers').textContent = String(b.parcels.length);
   }
@@ -899,10 +931,11 @@
   }
 
   function updateBuySummary() {
-    if (!state.basket) return;
-    const max = Math.max(1, state.basket.parcels.length);
+    const b = activeBasket();
+    if (!b) return;
+    const max = Math.max(1, b.parcels.length);
     const n = Math.min(max, Math.max(1, Number($('buySellers').value) || max));
-    const pt = state.basket.curve[n - 1];
+    const pt = b.curve[n - 1];
     $('buySummary').textContent = pt ? `${pt.cards} items · ${euros(pt.totalCents)} total` : '';
     updateExportButtons();
   }
@@ -928,11 +961,16 @@
     updateSellerCollapseControls();
   }
 
-  function renderParcelsAndTabs() {
-    const b = state.basket;
+  function renderParcelsAndTabs({ resetBuySellers = true } = {}) {
+    const b = activeBasket();
     if (!b) return;
-    $('buySellers').max = Math.max(1, b.parcels.length);
-    $('buySellers').value = b.parcels.length;
+    const maxSellers = Math.max(1, b.parcels.length);
+    $('buySellers').max = maxSellers;
+    if (resetBuySellers || !Number($('buySellers').value)) {
+      $('buySellers').value = b.parcels.length;
+    } else {
+      $('buySellers').value = Math.min(maxSellers, Math.max(1, Number($('buySellers').value)));
+    }
     updateBuySummary();
 
     // Missing items
@@ -956,6 +994,7 @@
       if (games.length > 1) badges.push('<span class="badge badge-combo">MTG + YGO combined</span>');
       else if (games[0]) badges.push(`<span class="badge ${games[0] === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${games[0] === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`);
       if (p.hasProducts) badges.push('<span class="badge badge-product">+ Product</span>');
+      if (p.hasTokens) badges.push(`<span class="badge badge-token">+${p.tokenCount} token${p.tokenCount === 1 ? '' : 's'}</span>`);
 
       return `
         <details class="parcel-card" ${idx < 3 ? 'open' : ''}>
@@ -983,11 +1022,14 @@
                       <strong>${esc(item.name)}</strong>
                       ${item.foil ? '<span class="badge badge-indigo">Foil</span>' : ''}
                       ${item.aboveMarket ? '<span class="badge badge-warn">above market</span>' : ''}
+                      ${item.kind === 'token' && item.tokenCovers?.length ? `<span class="token-covers-sub">Covers: ${esc(item.tokenCovers.join(' + '))}</span>` : ''}
                     </td>
                     <td>
                       ${item.kind === 'product'
                         ? '<span class="badge badge-product">Product</span>'
-                        : `<span class="badge ${item.game === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${item.game === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`}
+                        : item.kind === 'token'
+                          ? `<span class="badge badge-token">Token</span>${item.tokenCombo ? ' <span class="badge badge-token-combo">2-in-1</span>' : ''}`
+                          : `<span class="badge ${item.game === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${item.game === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`}
                       ${item.listName ? `<span style="font-size:12px;color:var(--text-muted)">${esc(item.listName)}</span>` : ''}
                     </td>
                     <td class="num"><strong>${euros(item.priceCents)}</strong></td>
@@ -1165,9 +1207,15 @@
           ? `Search saved ${euros(savedVsQuick)} vs quick basket`
           : 'Optimal basket found';
 
+      if (Object.keys(state.sellerTokenOffers).length && state.tokenCatalog && state.tokenMatchPlan) {
+        reoptimiseTokensFromMemory({ useAllParcels: true, renderBasket: false, silent: true });
+      } else {
+        state.tokenResult = null;
+        renderTokenResults();
+      }
       renderKpis(false, note);
       renderCutsAndLeftOut(false);
-      renderParcelsAndTabs();
+      renderParcelsAndTabs({ resetBuySellers: true });
       renderActiveLimits();
       if (state.limitsOpen) estimateLimitsForCurrentScope();
       hideProgress();
@@ -1506,9 +1554,10 @@
   const scryfallPrintingCache = new Map();
 
   function basketEntries() {
-    if (!state.basket) return [];
-    const n = Math.max(1, Number($('buySellers').value) || state.basket.parcels.length);
-    return collectBasketEntries(state.basket.parcels.slice(0, n));
+    const b = activeBasket();
+    if (!b) return [];
+    const n = Math.max(1, Number($('buySellers').value) || b.parcels.length);
+    return collectBasketEntries(b.parcels.slice(0, n));
   }
 
   function leftOutEntries() {
@@ -1528,7 +1577,7 @@
   async function resolvePrintings(entries) {
     const ids = [...new Set(
       (entries || [])
-        .filter(e => (e.game || 'Magic') === 'Magic' && e.kind !== 'product')
+        .filter(e => (e.game || 'Magic') === 'Magic' && e.kind !== 'product' && e.kind !== 'token')
         .map(e => e.idProduct)
         .filter(Boolean)
     )];
@@ -1562,7 +1611,7 @@
     if (format === 'plain') {
       return formatPlainExport(entries, { groupBy });
     }
-    const magicOnly = (entries || []).filter(e => (e.game || 'Magic') === 'Magic' && e.kind !== 'product');
+    const magicOnly = (entries || []).filter(e => (e.game || 'Magic') === 'Magic' && e.kind !== 'product' && e.kind !== 'token');
     if (!magicOnly.length) return { text: '', count: 0 };
     const found = await resolvePrintings(preloadEntries || magicOnly);
     return formatArchidektExport(magicOnly, found, { categoryBy });
@@ -1590,7 +1639,7 @@
     const notice = $('exportModalNotice');
     if (skippedNonMagic > 0) {
       notice.hidden = false;
-      notice.textContent = `Archidekt supports Magic cards only — ${skippedNonMagic} non-Magic / product item${skippedNonMagic === 1 ? '' : 's'} omitted here (use Export list for those).`;
+      notice.textContent = `Archidekt supports Magic cards only — ${skippedNonMagic} non-Magic / product / token item${skippedNonMagic === 1 ? '' : 's'} omitted here (use Export list for those).`;
     } else {
       notice.hidden = true;
     }
@@ -1617,6 +1666,7 @@
 
     const badgeFor = g => {
       if (g.kind === 'product') return '<span class="badge badge-product">Product</span>';
+      if (g.kind === 'token') return '<span class="badge badge-token">Tokens</span>';
       return `<span class="badge ${g.game === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${g.game === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`;
     };
 
@@ -1761,7 +1811,7 @@
         if (s.trackedOnly) known[s.seller] = Date.now();
       }
       if (learned.length) await rememberTracked(known);
-      const predicted = new Map((state.basket?.parcels || []).map(p => [p.seller, p]));
+      const predicted = new Map((activeBasket()?.parcels || []).map(p => [p.seller, p]));
       const diffs = shipments.filter(s => predicted.has(s.seller) && s.shippingCents !== predicted.get(s.seller).shippingCents);
       const sum = k => shipments.reduce((t, s) => t + (s[k] || 0), 0);
       out.innerHTML = `<div class="alert-banner alert-info" style="margin-bottom:12px">
@@ -1781,9 +1831,10 @@
   }
 
   async function addToCart() {
-    if (!state.basket || state.fetching || state.carting || state.optimising) return;
-    const n = Math.max(1, Number($('buySellers').value) || state.basket.parcels.length);
-    const parcels = state.basket.parcels.slice(0, n);
+    const b = activeBasket();
+    if (!b || state.fetching || state.fetchingTokens || state.carting || state.optimising) return;
+    const n = Math.max(1, Number($('buySellers').value) || b.parcels.length);
+    const parcels = b.parcels.slice(0, n);
     const { key: cartKey, added } = await alreadyAdded();
     let skipped = 0;
     const orders = parcels.map(parcel => {
@@ -1861,10 +1912,397 @@
     }
   }
 
+  // ---- Deck-Scoped Magic Tokens ----
+  const EXAMPLE_TOKENS = `# Deck 1 (e.g. Edgar Markov)
+4x 1/1 Black Vampire
+2x Treasure
+
+# Deck 2 (e.g. Chatterfang)
+4x 1/1 Green Squirrel
+2x Food`;
+
+  async function saveTokenState() {
+    await chrome.storage.local.set({
+      bwTokensState: {
+        text: state.tokensText,
+        deckOptions: state.tokenDeckOptions,
+        settings: state.tokenSettings,
+        includeTokensInBasket: state.includeTokensInBasket,
+      },
+    });
+  }
+
+  async function ensureTokenCatalog() {
+    if (state.tokenCatalog) return state.tokenCatalog;
+    if (!state.tokenCatalogLoading) {
+      state.tokenCatalogLoading = chrome.runtime.sendMessage({ type: 'token-catalog' })
+        .then(res => {
+          if (!res || res.error) throw new Error(res?.error || 'Failed to load Magic token catalogue');
+          state.tokenCatalog = buildTokenCatalog(res.tokens || []);
+          return state.tokenCatalog;
+        })
+        .finally(() => { state.tokenCatalogLoading = null; });
+    }
+    return state.tokenCatalogLoading;
+  }
+
+  function selectedBasketParcels() {
+    if (!state.basket?.parcels?.length) return [];
+    const max = state.basket.parcels.length;
+    const n = Math.min(max, Math.max(1, Number($('buySellers').value) || max));
+    return state.basket.parcels.slice(0, n);
+  }
+
+  function renderTokenDeckToggles(decks) {
+    const box = $('tokenDeckToggles');
+    if (!decks.length) {
+      box.hidden = true;
+      box.innerHTML = '';
+      return;
+    }
+    box.hidden = false;
+    box.innerHTML = '<span class="scope-label">Within-deck 2-for-1 DFC combos:</span>' + decks.map(d => {
+      const allowed = d.allowCombos !== false;
+      return `
+        <label class="token-deck-chip ${allowed ? '' : 'combos-off'}" title="Allow double-sided tokens (A // B) to cover two different tokens in this deck. Never combines across different decks.">
+          <input type="checkbox" data-token-deck="${esc(d.deckName)}" ${allowed ? 'checked' : ''}>
+          <span>${esc(d.deckName)}</span>
+          <span style="font-size:11px;opacity:.75">${allowed ? '2-in-1 ON' : '2-in-1 OFF'}</span>
+        </label>`;
+    }).join('');
+
+    box.querySelectorAll('[data-token-deck]').forEach(cb => {
+      cb.addEventListener('change', async () => {
+        const name = cb.dataset.tokenDeck;
+        state.tokenDeckOptions = { ...state.tokenDeckOptions, [name]: { allowCombos: cb.checked } };
+        await saveTokenState();
+        refreshTokenPreview();
+        reoptimiseTokensFromMemory({ resetBuySellers: false, silent: true });
+      });
+    });
+  }
+
+  function renderTokenPreview() {
+    const box = $('tokenPreviewBox');
+    const decks = parseTokenListText(state.tokensText, state.tokenDeckOptions);
+    renderTokenDeckToggles(decks);
+
+    if (!decks.length) {
+      state.tokenMatchPlan = null;
+      $('tabCountTokens').textContent = '0';
+      box.innerHTML = '';
+      return;
+    }
+
+    const totalFaces = decks.reduce((s, d) => s + d.requests.reduce((r, x) => r + x.qty, 0), 0);
+    if (!state.tokenResult) $('tabCountTokens').textContent = String(totalFaces);
+
+    if (!state.tokenCatalog) {
+      box.innerHTML = '<div class="empty-mini">Loading Cardmarket Magic token catalogue (13,000+ printings)…</div>';
+      ensureTokenCatalog()
+        .then(() => refreshTokenPreview())
+        .catch(err => {
+          box.innerHTML = `<div class="alert-banner alert-warn">Could not load token catalogue: ${esc(err.message)}</div>`;
+        });
+      return;
+    }
+
+    state.tokenMatchPlan = matchTokenDecks(decks, state.tokenCatalog, {
+      maxPriceCents: state.tokenSettings.maxPriceCents,
+      foil: state.tokenSettings.foil,
+    });
+
+    box.innerHTML = state.tokenMatchPlan.decks.map(deck => {
+      const deckFaces = deck.requests.reduce((s, r) => s + r.qty, 0);
+      const rows = deck.requests.map(req => {
+        let statusBadge;
+        if (req.matchCount === 0) {
+          statusBadge = '<span class="badge badge-danger">No catalogue match</span>';
+        } else if (req.likelyProxy) {
+          statusBadge = `<span class="badge badge-warn">Likely proxy (guide ${euros(req.cheapestGuideCents)})</span>`;
+        } else {
+          statusBadge = `<span class="badge badge-combo">${req.matchCount} printing${req.matchCount === 1 ? '' : 's'}${req.doubleCount ? ` (${req.doubleCount} DFC)` : ''}</span>`;
+        }
+        return `
+          <tr>
+            <td><strong>${req.qty}×</strong> ${esc(req.label)}</td>
+            <td>${statusBadge}${req.fuzzy ? ' <span class="badge badge-neutral">fuzzy</span>' : ''}</td>
+            <td class="num">${req.cheapestGuideCents !== null ? euros(req.cheapestGuideCents) : '–'}</td>
+            <td style="font-size:12px;color:var(--text-muted)">${esc((req.sampleNames || []).slice(0, 2).join(' · '))}</td>
+          </tr>`;
+      }).join('');
+
+      const comboHtml = deck.allowCombos && deck.combos.length
+        ? `<div class="token-combo-hint">
+            <strong>Within-deck 2-for-1 DFC options (${deck.combos.length}):</strong>
+            ${deck.combos.slice(0, 5).map(c => `${esc(c.name)}${c.cheapestGuideCents !== null ? ` (${euros(c.cheapestGuideCents)})` : ''}`).join(' · ')}${deck.combos.length > 5 ? ` + ${deck.combos.length - 5} more` : ''}
+          </div>`
+        : (!deck.allowCombos ? '<div class="token-combo-hint" style="background:#fff7ed;border-color:#fdba74;color:#9a3412">2-for-1 DFC combining disabled for this deck (each token gets its own card).</div>' : '');
+
+      return `
+        <div class="token-deck-card">
+          <div class="token-deck-card-head">
+            <span>${esc(deck.deckName)}</span>
+            <span class="badge badge-neutral">${deckFaces} token face${deckFaces === 1 ? '' : 's'}</span>
+          </div>
+          <div class="token-deck-card-body">
+            <div class="table-scroll">
+              <table class="data-table">
+                <thead><tr><th>Wanted token</th><th>Catalogue match</th><th class="num">Guide low</th><th>Sample Cardmarket printings</th></tr></thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>
+            ${comboHtml}
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  function refreshTokenPreview() {
+    renderTokenPreview();
+  }
+
+  function renderTokenResults() {
+    const area = $('tokenResultsArea');
+    const reoptBtn = $('btnReoptTokens');
+    const res = state.tokenResult;
+    const hasSellerOffers = selectedBasketParcels().some(p => Array.isArray(state.sellerTokenOffers[p.seller]));
+    if (reoptBtn) reoptBtn.hidden = !hasSellerOffers;
+
+    if (!res) {
+      area.hidden = true;
+      const decks = parseTokenListText(state.tokensText, state.tokenDeckOptions);
+      const totalFaces = decks.reduce((s, d) => s + d.requests.reduce((r, x) => r + x.qty, 0), 0);
+      $('tabCountTokens').textContent = String(totalFaces);
+      return;
+    }
+
+    area.hidden = false;
+    const st = res.stats;
+    $('tabCountTokens').textContent = String(st.physicalTokensBought);
+
+    $('tokenSummaryBar').innerHTML = `
+      <div>
+        <strong>Covered ${st.coveredFaces}/${st.totalRequestedFaces} token faces</strong>
+        with <strong>${st.physicalTokensBought} physical card${st.physicalTokensBought === 1 ? '' : 's'}</strong>${st.comboCardsUsed ? ` (${st.comboCardsUsed} two-for-one DFC${st.comboCardsUsed === 1 ? '' : 's'})` : ''} ·
+        <strong>${euros(st.tokensCents)}</strong> tokens + <strong>${euros(st.shippingDeltaCents)}</strong> shipping Δ
+        ${st.coveredFaces ? ` · avg <strong>${euros(st.avgPerFaceCents)}/face</strong>` : ''}
+      </div>
+      <div>
+        ${st.proxyFaces > 0
+          ? `<span class="badge badge-warn">${st.proxyFaces} face${st.proxyFaces === 1 ? '' : 's'} to proxy</span>`
+          : '<span class="badge badge-combo">100% covered!</span>'}
+      </div>`;
+
+    // Matched tokens table
+    const matchedBox = $('tokenMatchedBox');
+    if (res.assignments.length) {
+      matchedBox.innerHTML = `
+        <div class="token-section-head">
+          <h3>Matched Tokens (${res.assignments.length} cards at ${res.bySeller.size} existing seller${res.bySeller.size === 1 ? '' : 's'})</h3>
+        </div>
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead>
+              <tr><th>Seller</th><th>Deck</th><th>Token Card</th><th>Covers</th><th class="num">Price</th><th class="num">Ship Δ</th><th class="num">Eff./face</th></tr>
+            </thead>
+            <tbody>
+              ${res.assignments.map(a => `
+                <tr>
+                  <td><strong>${esc(a.seller)}</strong></td>
+                  <td><span class="badge badge-neutral">${esc(a.deckName)}</span></td>
+                  <td>
+                    <strong>${esc(a.name)}</strong>
+                    ${a.isCombo ? ' <span class="badge badge-token-combo">2-in-1</span>' : ''}
+                    ${a.foil ? ' <span class="badge badge-indigo">Foil</span>' : ''}
+                  </td>
+                  <td>${esc(a.coveredLabels.join(' + '))}</td>
+                  <td class="num">${euros(a.priceCents)}</td>
+                  <td class="num">${a.shippingDeltaCents ? `+${euros(a.shippingDeltaCents)}` : '0,00 €'}</td>
+                  <td class="num"><strong>${euros(a.effectivePerFaceCents)}</strong></td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>`;
+    } else {
+      matchedBox.innerHTML = '<div class="empty-mini">No tokens matched within your price cap and filters at your current basket sellers.</div>';
+    }
+
+    // Proxy / Skip list
+    const proxyBox = $('tokenProxyBox');
+    if (res.proxyList.length) {
+      proxyBox.innerHTML = `
+        <div class="token-section-head">
+          <h3>Proxy / Skip List (${res.stats.proxyFaces} faces)</h3>
+          <button type="button" id="btnCopyProxyTokens" class="btn btn-secondary btn-xs">Copy proxy list</button>
+        </div>
+        <div class="table-scroll">
+          <table class="data-table">
+            <thead><tr><th>Deck</th><th>Token</th><th class="num">Qty</th><th>Reason</th></tr></thead>
+            <tbody>
+              ${res.proxyList.map(p => `
+                <tr>
+                  <td><span class="badge badge-neutral">${esc(p.deckName)}</span></td>
+                  <td><strong>${esc(p.label)}</strong></td>
+                  <td class="num">${p.remainingQty}${p.remainingQty < p.requestedQty ? ` / ${p.requestedQty}` : ''}</td>
+                  <td style="color:var(--text-muted)">${esc(p.reason)}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>`;
+      $('btnCopyProxyTokens')?.addEventListener('click', async () => {
+        const text = formatProxyListText(res.proxyList);
+        if (!text) return;
+        await navigator.clipboard.writeText(text);
+        toast(`Copied ${res.stats.proxyFaces} tokens to proxy.`, 'success');
+      });
+    } else {
+      proxyBox.innerHTML = '';
+    }
+  }
+
+  function reoptimiseTokensFromMemory({ resetBuySellers = false, silent = false, useAllParcels = false, renderBasket = true } = {}) {
+    const targetParcels = useAllParcels ? (state.basket?.parcels || []) : selectedBasketParcels();
+    if (!targetParcels.length || !state.tokenCatalog || !state.tokenMatchPlan || !state.currentTables) {
+      state.tokenResult = null;
+      renderTokenResults();
+      return;
+    }
+    const hasOffers = targetParcels.some(p => Array.isArray(state.sellerTokenOffers[p.seller]));
+    if (!hasOffers) {
+      state.tokenResult = null;
+      renderTokenResults();
+      return;
+    }
+    state.tokenResult = optimizeTokens(
+      state.tokenMatchPlan,
+      targetParcels,
+      state.sellerTokenOffers,
+      state.tokenCatalog,
+      {
+        tables: state.currentTables,
+        trackedOnly: Object.keys(state.trackedSellers),
+        maxPriceCents: state.tokenSettings.maxPriceCents,
+        targetPriceCents: Math.min(10, state.tokenSettings.maxPriceCents),
+        minCondition: state.tokenSettings.minCondition,
+        language: state.tokenSettings.language,
+        foil: state.tokenSettings.foil,
+        parcelShippingFn: parcelShipping,
+      }
+    );
+    renderTokenResults();
+    if (renderBasket) {
+      renderKpis(false);
+      renderParcelsAndTabs({ resetBuySellers });
+    }
+    if (!silent) {
+      const st = state.tokenResult.stats;
+      toast(`Re-optimised tokens: ${st.coveredFaces}/${st.totalRequestedFaces} faces (${euros(st.totalAddedCents)}).`, 'success');
+    }
+  }
+
+  async function findTokensAtBasketSellers() {
+    if (workInProgress()) return;
+    const targetParcels = selectedBasketParcels();
+    if (!targetParcels.length) {
+      toast('Compute a basket first so tokens can ride along on your existing sellers.', 'error');
+      return;
+    }
+
+    const decks = parseTokenListText(state.tokensText, state.tokenDeckOptions);
+    if (!decks.length) {
+      toast('Paste at least one token in the text box first.', 'error');
+      return;
+    }
+
+    state.fetchingTokens = true;
+    const controller = new AbortController();
+    state.controller = controller;
+    syncBusyUI();
+
+    try {
+      const { collectionRetryAfter: holdUntil } = await chrome.storage.local.get('collectionRetryAfter');
+      if (Date.now() < holdUntil) {
+        throw new Error(`Cardmarket asked to wait until ${new Date(holdUntil).toLocaleTimeString()}.`);
+      }
+
+      showProgress('Loading Magic token catalogue…', '', 10);
+      const catalog = await ensureTokenCatalog();
+      state.tokenMatchPlan = matchTokenDecks(decks, catalog, {
+        maxPriceCents: state.tokenSettings.maxPriceCents,
+        foil: state.tokenSettings.foil,
+      });
+      renderTokenPreview();
+
+      if (!state.tokenMatchPlan.wantedProductIds.size) {
+        hideProgress();
+        toast('None of the pasted tokens matched a Cardmarket Magic token printing.', 'error');
+        return;
+      }
+
+      const sellers = targetParcels.map(p => p.seller);
+      const cache = await offerCache(false);
+      let waitingText = '';
+      let waitUntil = 0;
+
+      const result = await collectSellerTokens(sellers, state.tokenMatchPlan, site, {
+        maxPriceCents: state.tokenSettings.maxPriceCents,
+        tokenIds: new Set(catalog.byId.keys()),
+        cache,
+        cacheMaxAgeMs: CACHE_MAX_AGE_MS,
+        intervalMs: state.interval,
+        signal: controller.signal,
+        waitForUser,
+        log: record,
+        readRetryDelays: [5000, 10000, 20000, 40000, 80000],
+        onDeferred: ({ until }) => chrome.storage.local.set({ collectionRetryAfter: until }),
+        onWait: ({ until, retry }) => {
+          waitUntil = until;
+          waitingText = `Cardmarket asked to slow down — retry ${retry}/5 at ${new Date(until).toLocaleTimeString()}`;
+          showProgress('Waiting for Cardmarket rate limit…', waitingText, null);
+        },
+        onProgress: ({ done, total, seller, requests, retries, fromCache }) => {
+          if (Date.now() > waitUntil) waitingText = '';
+          const pct = 15 + Math.round((done / Math.max(1, total)) * 80);
+          showProgress(
+            `Checking basket sellers for cheap tokens (${done}/${total})`,
+            `${seller}${fromCache ? ' (cached)' : ''} · ${requests} requests${retries ? ` · ${retries} retries` : ''}`,
+            pct,
+            waitingText,
+          );
+        },
+      });
+
+      state.sellerTokenOffers = { ...state.sellerTokenOffers, ...result.offersBySeller };
+      hideProgress();
+      reoptimiseTokensFromMemory({ resetBuySellers: false, silent: true });
+
+      const st = state.tokenResult?.stats;
+      if (result.blocked) {
+        toast(`Stopped early: ${result.blocked}`, 'error');
+      } else if (st && st.physicalTokensBought > 0) {
+        toast(`Matched ${st.coveredFaces}/${st.totalRequestedFaces} token faces (${st.physicalTokensBought} cards, +${euros(st.totalAddedCents)}).`, 'success');
+      } else {
+        toast(`Checked ${sellers.length} basket sellers — no matching tokens within ${euros(state.tokenSettings.maxPriceCents)}.`);
+      }
+    } catch (error) {
+      hideProgress();
+      record({ type: 'tokens-error', message: error.message });
+      toast(`Token lookup failed: ${error.message}`, 'error');
+    } finally {
+      if (state.controller === controller) state.controller = null;
+      state.fetchingTokens = false;
+      syncBusyUI();
+    }
+  }
+
   // ---- Tabs ----
   function switchTab(name) {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.dataset.panel === name));
+    if (name === 'tokens' && !state.tokenCatalog) {
+      ensureTokenCatalog().then(() => refreshTokenPreview()).catch(() => {});
+    }
   }
 
   // ---- Handle incoming context (from Wants List or Product page button) ----
@@ -1927,7 +2365,7 @@
 
     // Load persisted state
     const data = await chrome.storage.local.get([
-      'bwAppSettings', 'knownWantsLists', 'extraProducts', 'trackedSellers', 'bwRuns', 'productPaths',
+      'bwAppSettings', 'knownWantsLists', 'extraProducts', 'trackedSellers', 'bwRuns', 'productPaths', 'bwTokensState',
     ]);
     for (const [id, path] of Object.entries(data.productPaths || {})) knownPaths.set(Number(id), path);
     state.knownLists = (data.knownWantsLists || []).map(l => (
@@ -1954,10 +2392,25 @@
     $('interval').value = state.interval;
     $('trackedSellers').value = Object.keys(state.trackedSellers).sort().join(', ');
 
+    const ts = data.bwTokensState || {};
+    state.tokensText = typeof ts.text === 'string' ? ts.text : '';
+    state.tokenDeckOptions = ts.deckOptions && typeof ts.deckOptions === 'object' ? ts.deckOptions : {};
+    if (ts.settings && typeof ts.settings === 'object') {
+      state.tokenSettings = { ...state.tokenSettings, ...ts.settings };
+    }
+    state.includeTokensInBasket = ts.includeTokensInBasket !== false;
+    $('tokensInput').value = state.tokensText;
+    $('tokenMaxPrice').value = (state.tokenSettings.maxPriceCents / 100).toFixed(2);
+    $('tokenMinCond').value = String(state.tokenSettings.minCondition ?? 5);
+    $('tokenLanguage').value = state.tokenSettings.language != null ? String(state.tokenSettings.language) : '';
+    $('tokenFoil').value = state.tokenSettings.foil || 'N';
+    $('chkIncludeTokens').checked = state.includeTokensInBasket;
+
     renderLists();
     renderProducts();
     renderRegionControls();
     renderSavedRuns();
+    refreshTokenPreview();
 
     // Handle URL query params (when launched from Cardmarket Wants List or Product page)
     const urlParams = Object.fromEntries(new URLSearchParams(location.search).entries());
@@ -2053,6 +2506,75 @@
     });
 
     $('buySellers').addEventListener('input', updateBuySummary);
+    $('buySellers').addEventListener('change', () => {
+      if (state.tokenResult && Object.keys(state.sellerTokenOffers).length) {
+        reoptimiseTokensFromMemory({ resetBuySellers: false, silent: true });
+      }
+    });
+
+    // ---- Tokens Tab Event Listeners ----
+    let tokenInputTimer = null;
+    $('tokensInput').addEventListener('input', () => {
+      state.tokensText = $('tokensInput').value;
+      clearTimeout(tokenInputTimer);
+      tokenInputTimer = setTimeout(() => {
+        saveTokenState();
+        refreshTokenPreview();
+        reoptimiseTokensFromMemory({ resetBuySellers: false, silent: true });
+      }, 180);
+    });
+    $('btnAddTokenDeck').addEventListener('click', () => {
+      const existing = parseTokenListText($('tokensInput').value, state.tokenDeckOptions);
+      const nextNum = existing.length + 1;
+      const prefix = $('tokensInput').value.trim() ? '\n\n' : '';
+      $('tokensInput').value += `${prefix}# Deck ${nextNum}\n`;
+      state.tokensText = $('tokensInput').value;
+      $('tokensInput').focus();
+      saveTokenState();
+      refreshTokenPreview();
+    });
+    $('btnExampleTokens').addEventListener('click', () => {
+      $('tokensInput').value = EXAMPLE_TOKENS;
+      state.tokensText = EXAMPLE_TOKENS;
+      saveTokenState();
+      refreshTokenPreview();
+      reoptimiseTokensFromMemory({ resetBuySellers: false, silent: true });
+    });
+    $('btnClearTokens').addEventListener('click', () => {
+      $('tokensInput').value = '';
+      state.tokensText = '';
+      state.tokenResult = null;
+      saveTokenState();
+      refreshTokenPreview();
+      renderTokenResults();
+      renderKpis(false);
+      renderParcelsAndTabs({ resetBuySellers: false });
+    });
+
+    const onTokenSettingChange = async () => {
+      const eur = Number(String($('tokenMaxPrice').value || '0.20').replace(',', '.'));
+      state.tokenSettings = {
+        maxPriceCents: Number.isFinite(eur) && eur > 0 ? Math.max(1, Math.round(eur * 100)) : 20,
+        minCondition: Number($('tokenMinCond').value) || 5,
+        language: $('tokenLanguage').value ? Number($('tokenLanguage').value) : null,
+        foil: $('tokenFoil').value || 'N',
+      };
+      await saveTokenState();
+      refreshTokenPreview();
+      reoptimiseTokensFromMemory({ resetBuySellers: false, silent: true });
+    };
+    $('tokenMaxPrice').addEventListener('change', onTokenSettingChange);
+    $('tokenMinCond').addEventListener('change', onTokenSettingChange);
+    $('tokenLanguage').addEventListener('change', onTokenSettingChange);
+    $('tokenFoil').addEventListener('change', onTokenSettingChange);
+    $('chkIncludeTokens').addEventListener('change', async () => {
+      state.includeTokensInBasket = $('chkIncludeTokens').checked;
+      await saveTokenState();
+      renderKpis(false);
+      renderParcelsAndTabs({ resetBuySellers: false });
+    });
+    $('btnFindTokens').addEventListener('click', findTokensAtBasketSellers);
+    $('btnReoptTokens').addEventListener('click', () => reoptimiseTokensFromMemory({ resetBuySellers: false, silent: false }));
     $('btnExpandAllSellers').addEventListener('click', () => setAllSellersExpanded(true));
     $('btnCollapseAllSellers').addEventListener('click', () => setAllSellersExpanded(false));
     $('btnBuy').addEventListener('click', addToCart);

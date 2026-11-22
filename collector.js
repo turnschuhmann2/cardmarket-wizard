@@ -319,6 +319,46 @@
     };
   }
 
+  function parseUserOffersPage(page, seller, pageNumber, originRef = 'https://www.cardmarket.com', { requireAttributes = true, allowEmpty = false } = {}) {
+    const table = page.querySelector('#UserOffersTable');
+    if (!table) {
+      if (allowEmpty) {
+        const bodyText = page.body?.textContent || page.documentElement?.textContent || '';
+        if (page.querySelector('.noResults, .no-results, #UserOffers, .total-count') ||
+            /sorry,\s*no\s+matches|no\s+(results|offers|articles)\s+found|0\s+hits/i.test(bodyText)) {
+          return { offers: [], skipped: 0, total: 0, hasNext: false };
+        }
+      }
+      throw new Error(`Offers of ${seller} did not load as expected`);
+    }
+    const offers = [];
+    let skipped = 0;
+    for (const row of page.querySelectorAll('#UserOffersTable [id^="stockRow"]')) {
+      const attributes = tips(row, '.product-attributes');
+      const price = row.querySelector('.price-container .color-primary');
+      const quantity = row.querySelector('.amount-container .item-count') || row.querySelector('.item-count');
+      const condition = attributes.find(text => text in CONDITIONS);
+      const language = attributes.find(text => text in LANGUAGES);
+      if (!price || !quantity || (requireAttributes && (!condition || !language))) { skipped += 1; continue; }
+      offers.push({
+        idArticle: Number(row.id.replace('stockRow', '')),
+        seller,
+        idProduct: productOf(row),
+        condition: condition ? CONDITIONS[condition] : null,
+        language: language ? LANGUAGES[language] : null,
+        foil: attributes.includes('Foil'),
+        signed: attributes.includes('Signed'),
+        altered: attributes.includes('Altered'),
+        priceCents: cents(price.textContent),
+        quantity: parseInt(quantity.textContent, 10),
+      });
+    }
+    const total = parseInt((page.querySelector('.total-count')?.textContent || '').replace(/\D/g, ''), 10);
+    const hasNext = [...page.querySelectorAll('a[href*="site="]')]
+      .some(link => new URL(link.getAttribute('href'), originRef).searchParams.get('site') === String(pageNumber + 1));
+    return { offers, skipped, total: Number.isFinite(total) ? total : null, hasNext };
+  }
+
   // Reads Cardmarket pages through fetch in a logged-in cardmarket.com tab (or via bridgeFetch).
   function browserSite({ fetchImpl = root.fetch.bind(root), paths = null, onResponse = () => {}, game = 'Magic', getToken = null, baseOrigin = '' } = {}) {
     const baseFor = g => `${baseOrigin}/en/${g || game}`;
@@ -536,27 +576,20 @@
         if (pageNumber > 1) params.set('site', pageNumber);
         const { text: html } = await request(`${baseFor(gameOverride)}/Users/${encodeURIComponent(seller)}/Offers/Singles?${params}`);
         const page = new DOMParser().parseFromString(html, 'text/html');
-        if (!page.querySelector('#UserOffersTable')) throw new Error(`Offers of ${seller} did not load as expected`);
-        const offers = [];
-        let skipped = 0;
-        for (const row of page.querySelectorAll('#UserOffersTable [id^="stockRow"]')) {
-          const attributes = tips(row, '.product-attributes');
-          const price = row.querySelector('.price-container .color-primary');
-          const quantity = row.querySelector('.amount-container .item-count') || row.querySelector('.item-count');
-          const condition = attributes.find(text => text in CONDITIONS);
-          const language = attributes.find(text => text in LANGUAGES);
-          if (!price || !quantity || !condition || !language) { skipped += 1; continue; }
-          offers.push({
-            idArticle: Number(row.id.replace('stockRow', '')), seller, idProduct: productOf(row),
-            condition: CONDITIONS[condition], language: LANGUAGES[language],
-            foil: attributes.includes('Foil'), signed: attributes.includes('Signed'), altered: attributes.includes('Altered'),
-            priceCents: cents(price.textContent), quantity: parseInt(quantity.textContent, 10),
-          });
-        }
-        const total = parseInt((page.querySelector('.total-count')?.textContent || '').replace(/\D/g, ''), 10);
-        const hasNext = [...page.querySelectorAll('a[href*="site="]')]
-          .some(link => new URL(link.getAttribute('href'), originRef).searchParams.get('site') === String(pageNumber + 1));
-        return { offers, skipped, total: Number.isFinite(total) ? total : null, hasNext };
+        return parseUserOffersPage(page, seller, pageNumber, originRef, { requireAttributes: true, allowEmpty: false });
+      },
+
+      // A seller's cheap Magic token offers (idRarity=24, sorted cheapest-first, 20 per page).
+      async sellerTokens(seller, { maxPriceEur = 0.20, name = null, rarity = 24, pageNumber = 1, sortBy = 'price_asc' } = {}) {
+        const params = new URLSearchParams();
+        if (rarity != null) params.set('idRarity', String(rarity));
+        if (maxPriceEur != null) params.set('maxPrice', Number(maxPriceEur).toFixed(2));
+        if (name) params.set('name', name);
+        if (sortBy) params.set('sortBy', sortBy);
+        if (pageNumber > 1) params.set('site', String(pageNumber));
+        const { text: html } = await request(`${baseFor('Magic')}/Users/${encodeURIComponent(seller)}/Offers/Singles?${params}`);
+        const page = new DOMParser().parseFromString(html, 'text/html');
+        return parseUserOffersPage(page, seller, pageNumber, originRef, { requireAttributes: false, allowEmpty: true });
       },
 
       async addToCart(idArticle, amount, gameOverride) {
@@ -639,7 +672,7 @@
 
   const BUCKETS = {
     firstPage: 'products', nextPage: 'products', productPage: 'products',
-    cardPage: 'cards', sellerWants: 'users',
+    cardPage: 'cards', sellerWants: 'users', sellerTokens: 'users',
     addToCart: 'cart', addSellerToCart: 'cart',
   };
 
@@ -1336,6 +1369,153 @@
       rule: { targetCopies, targetSellers, cutoffFactor, cutoffMarginCents, minSellers, sellerBatch, sellerLimit, improvementCents, minSellerCards } };
   }
 
+  /*
+   * Fetches cheap Magic token offers strictly from existing basket sellers (users bucket, 8h cache).
+   * - Normal sellers (<= maxFullPages * 20 cheap tokens): fetches & caches ALL cheap tokens so
+   *   editing token lists/settings later costs zero requests.
+   * - Mega-powersellers (> maxFullPages * 20 cheap tokens) or if idRarity=24 is not applied:
+   *   falls back to targeted ?name=<term>&maxPrice=... queries per wanted token type.
+   */
+  async function collectSellerTokens(sellers, tokenPlan, site, options = {}) {
+    const {
+      maxPriceCents = 20,
+      tokenIds = null,
+      maxFullPages = 6,
+      maxSearchPages = 3,
+      cache = null,
+      cacheMaxAgeMs = CACHE_MAX_AGE_MS,
+      onProgress = () => {},
+      log = () => {},
+    } = options;
+
+    const uniqueSellers = [...new Set((sellers || []).filter(Boolean))];
+    const searchTerms = [...new Set((tokenPlan?.searchTerms || []).filter(Boolean))];
+    const maxPriceEur = maxPriceCents / 100;
+    const runner = createRunner(site, options);
+    const { call, stats } = runner;
+
+    log({ type: 'tokens-start', sellers: uniqueSellers.length, searchTerms: searchTerms.length, maxPriceCents });
+
+    const offersBySeller = {};
+    const sellerSummaries = [];
+    let done = 0;
+
+    async function fetchOneSeller(seller) {
+      const summary = { seller, mode: 'full', pages: 0, offers: 0, total: null, fromCache: false, status: 'ok', error: null };
+      const byArticle = new Map();
+      const addOffers = list => {
+        for (const offer of list || []) {
+          if (offer && offer.idArticle != null) byArticle.set(offer.idArticle, offer);
+        }
+      };
+
+      const fullCacheKey = `tokens|${seller}|${maxPriceCents}`;
+      const fullHit = cache?.get(fullCacheKey);
+      if (fullHit && Date.now() - fullHit.at < cacheMaxAgeMs && fullHit.value?.mode === 'full') {
+        stats.cachedQueries += 1;
+        addOffers(fullHit.value.offers);
+        summary.fromCache = true;
+        summary.total = fullHit.value.total ?? byArticle.size;
+        summary.offers = byArticle.size;
+        offersBySeller[seller] = [...byArticle.values()];
+        sellerSummaries.push(summary);
+        done += 1;
+        onProgress({ done, total: uniqueSellers.length, seller, requests: stats.requests, retries: stats.retries, fromCache: true });
+        log({ type: 'seller-tokens', ...summary });
+        return;
+      }
+
+      try {
+        const page1 = await call('sellerTokens', seller, { maxPriceEur, rarity: 24, pageNumber: 1, sortBy: 'price_asc' });
+        summary.pages += 1;
+        summary.total = page1.total;
+
+        let rarityIgnored = false;
+        if (tokenIds && tokenIds.size > 0) {
+          const identified = page1.offers.filter(o => o.idProduct != null);
+          if (identified.length >= 4) {
+            const matchedTokens = identified.filter(o => tokenIds.has(o.idProduct)).length;
+            if (matchedTokens / identified.length < 0.5) rarityIgnored = true;
+          }
+        }
+
+        const smallEnough = !rarityIgnored && (
+          page1.total !== null ? page1.total <= maxFullPages * 20 : !page1.hasNext
+        );
+
+        if (smallEnough) {
+          summary.mode = 'full';
+          addOffers(page1.offers);
+          let hasNext = page1.hasNext;
+          let lastPrice = page1.offers.at(-1)?.priceCents ?? 0;
+          for (let pageNumber = 2; hasNext && pageNumber <= maxFullPages && lastPrice <= maxPriceCents; pageNumber += 1) {
+            if (runner.blocked()) break;
+            const page = await call('sellerTokens', seller, { maxPriceEur, rarity: 24, pageNumber, sortBy: 'price_asc' });
+            summary.pages += 1;
+            addOffers(page.offers);
+            hasNext = page.hasNext;
+            if (page.offers.length) lastPrice = page.offers.at(-1).priceCents;
+            else break;
+          }
+          const list = [...byArticle.values()];
+          cache?.set(fullCacheKey, { at: Date.now(), value: { mode: 'full', total: page1.total, offers: list } });
+        } else {
+          summary.mode = rarityIgnored ? 'targeted-fallback' : 'targeted';
+          for (const o of page1.offers) {
+            if (!tokenIds || (o.idProduct != null && tokenIds.has(o.idProduct))) addOffers([o]);
+          }
+          for (const term of searchTerms) {
+            if (runner.blocked()) break;
+            const termKey = `tokens-q|${seller}|${maxPriceCents}|${term.toLowerCase()}`;
+            const termHit = cache?.get(termKey);
+            if (termHit && Date.now() - termHit.at < cacheMaxAgeMs) {
+              stats.cachedQueries += 1;
+              addOffers(termHit.value?.offers || []);
+              continue;
+            }
+            const termOffers = [];
+            let hasNext = true;
+            for (let pageNumber = 1; hasNext && pageNumber <= maxSearchPages; pageNumber += 1) {
+              if (runner.blocked()) break;
+              const page = await call('sellerTokens', seller, {
+                maxPriceEur,
+                rarity: rarityIgnored ? null : 24,
+                name: term,
+                pageNumber,
+                sortBy: 'price_asc',
+              });
+              summary.pages += 1;
+              termOffers.push(...page.offers);
+              hasNext = page.hasNext && (!page.offers.length ? false : page.offers.at(-1).priceCents <= maxPriceCents);
+            }
+            addOffers(termOffers);
+            cache?.set(termKey, { at: Date.now(), value: { mode: 'term', offers: termOffers } });
+          }
+        }
+        summary.offers = byArticle.size;
+      } catch (error) {
+        summary.status = error instanceof BlockedError ? 'blocked' : 'error';
+        summary.error = error.message;
+      }
+
+      offersBySeller[seller] = [...byArticle.values()];
+      sellerSummaries.push(summary);
+      done += 1;
+      onProgress({ done, total: uniqueSellers.length, seller, requests: stats.requests, retries: stats.retries, fromCache: false });
+      log({ type: 'seller-tokens', ...summary });
+    }
+
+    const slot = limiter(2);
+    await Promise.all(uniqueSellers.map(seller => slot(() => {
+      if (runner.blocked()) return;
+      return fetchOneSeller(seller);
+    })));
+
+    runner.finish();
+    log({ type: 'tokens-end', ...stats, blocked: runner.blocked()?.message ?? null });
+    return { offersBySeller, sellerSummaries, stats, blocked: runner.blocked()?.message ?? null };
+  }
+
   // Reads a Wants List page. Every entry keeps its own filters.
   function parseWantsList(page, game = 'Magic') {
     const cards = new RegExp(`/${game}/Cards/`);
@@ -1371,7 +1551,8 @@
   }
 
   root.CardmarketCollector = {
-    collect, collectBySellers, createRunner, expansionGroups, browserSite, RefusedError,
+    collect, collectBySellers, collectSellerTokens, createRunner, expansionGroups, browserSite, RefusedError,
+    parseUserOffersPage,
     parseWantsList, parseWantsListName, parseWantsOverview, parseProductPageMeta, parseOfferRow, parseProductOfferRow,
     cents, allCents, RetryableError, BlockedError, StoppedError, LANGUAGES, CONDITIONS, CACHE_MAX_AGE_MS,
   };

@@ -175,8 +175,8 @@
             <span>Sellers carrying both Magic, Yu-Gi-Oh!, and sleeves combine into a single parcel to cut shipping.</span>
           </div>
           <div class="tip-box">
-            <strong>Scoped price limits</strong>
-            <span>Apply separate max price limits per game or per Wants List and recompute the whole basket live.</span>
+            <strong>Scoped price limits &amp; tokens</strong>
+            <span>Apply per-list price limits and ride cheap Magic tokens along on your existing sellers with deck-scoped 2-for-1 DFC matching.</span>
           </div>
         </div>
       </section>
@@ -238,6 +238,7 @@
         <section class="card workspace-card">
           <div class="tabs-bar">
             <button type="button" class="tab-btn active" data-tab="sellers">Basket by Seller <span class="tab-count" id="tabCountSellers">0</span></button>
+            <button type="button" class="tab-btn" data-tab="tokens">Tokens <span class="tab-count" id="tabCountTokens">0</span></button>
             <button type="button" class="tab-btn" data-tab="curve">Coverage Curve</button>
             <button type="button" class="tab-btn" data-tab="overlap">Top Sellers</button>
             <button type="button" class="tab-btn" data-tab="coverage">Fetch Coverage</button>
@@ -271,6 +272,84 @@
               </div>
             </div>
             <div id="parcelsList" class="parcels-list"></div>
+          </div>
+
+          <!-- Tab: Magic Tokens (Deck-Scoped Ride-Along) -->
+          <div class="tab-panel" data-panel="tokens">
+            <div class="tokens-intro">
+              <p class="card-hint" style="margin:0">
+                Paste Magic tokens grouped by deck using <code># Deck Name</code> headers.
+                Double-sided tokens (<code>A // B</code>) combine 2-for-1 <strong>only within the same deck</strong> — never across different decks.
+                Tokens ride along strictly on your current basket sellers (no new sellers opened) and stay at or below your price cap.
+              </p>
+            </div>
+
+            <div class="tokens-editor-head">
+              <span class="field-label" style="margin:0">Needed tokens (per deck)</span>
+              <div class="toolbar-group">
+                <button type="button" id="btnAddTokenDeck" class="btn btn-subtle btn-xs">+ Add deck</button>
+                <button type="button" id="btnExampleTokens" class="btn btn-ghost btn-xs">Example</button>
+                <button type="button" id="btnClearTokens" class="btn btn-ghost btn-xs">Clear</button>
+              </div>
+            </div>
+            <textarea id="tokensInput" class="tokens-textarea" rows="7" placeholder="# Deck 1 (e.g. Edgar Markov)&#10;4x 1/1 Black Vampire&#10;2x Treasure&#10;&#10;# Deck 2 (e.g. Chatterfang)&#10;4x 1/1 Green Squirrel&#10;2x Food"></textarea>
+
+            <div id="tokenDeckToggles" class="token-deck-toggles" hidden></div>
+
+            <div class="tokens-settings">
+              <label class="inline-label">Max price / face
+                <input type="number" id="tokenMaxPrice" class="input input-num-sm" min="0.01" max="5.00" step="0.01" value="0.20"> €
+              </label>
+              <label class="inline-label">Min condition
+                <select id="tokenMinCond" class="select select-sm">
+                  <option value="1">Mint</option>
+                  <option value="2">Near Mint</option>
+                  <option value="3">Excellent</option>
+                  <option value="4">Good</option>
+                  <option value="5" selected>Light Played</option>
+                  <option value="6">Played</option>
+                  <option value="7">Poor</option>
+                </select>
+              </label>
+              <label class="inline-label">Language
+                <select id="tokenLanguage" class="select select-sm">
+                  <option value="">Any language</option>
+                  <option value="1">English</option>
+                  <option value="3">German</option>
+                  <option value="2">French</option>
+                  <option value="5">Italian</option>
+                  <option value="4">Spanish</option>
+                  <option value="8">Portuguese</option>
+                  <option value="7">Japanese</option>
+                </select>
+              </label>
+              <label class="inline-label">Foil
+                <select id="tokenFoil" class="select select-sm">
+                  <option value="N" selected>Non-foil</option>
+                  <option value="any">Any</option>
+                  <option value="Y">Foil only</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="tokens-actions">
+              <div class="toolbar-group">
+                <button type="button" id="btnFindTokens" class="btn btn-primary btn-sm">Find tokens at basket sellers</button>
+                <button type="button" id="btnReoptTokens" class="btn btn-secondary btn-sm" hidden>Re-optimise tokens</button>
+              </div>
+              <label class="inline-check">
+                <input type="checkbox" id="chkIncludeTokens" checked>
+                <span>Include matched tokens in basket &amp; cart</span>
+              </label>
+            </div>
+
+            <div id="tokenPreviewBox" class="token-preview-box"></div>
+
+            <div id="tokenResultsArea" hidden>
+              <div id="tokenSummaryBar" class="token-summary-bar"></div>
+              <div id="tokenMatchedBox" class="token-section"></div>
+              <div id="tokenProxyBox" class="token-section"></div>
+            </div>
           </div>
 
           <!-- Tab: Coverage Curve -->
@@ -370,6 +449,7 @@
   <script src="collector.js"></script>
   <script src="wizard.js"></script>
   <script src="exports.js"></script>
+  <script src="tokens.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

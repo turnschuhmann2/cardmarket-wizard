@@ -26,10 +26,15 @@ After updating files, click **Reload** on the extension card in `chrome://extens
 4. **Scoped Price Limits (Per-game & Per-list):**
    - Open **Price Limits → Estimate limits** and pick a scope (**All cards**, **Magic only**, **Yu-Gi-Oh! only**, or any individual **Wants List**).
    - Estimates stream live from the Web Worker with loading skeletons. Applying or removing any limit immediately recomputes the **entire combined basket** from cache.
-5. **Export or Add to Cart:**
-   - **Copy / Export list** exports plain text either combined (grouped per Wants List & Extra Products) or one Wants List at a time (Copy or `.txt` download).
-   - **Copy / Export for Archidekt** exports Magic cards with Scryfall set codes, collector numbers, foil flags, and optional category tags (`[Seller]`, `[Wants List]`, or none). When multiple Magic Wants Lists are in the basket (or left-out list), a picker modal lets you copy or download each Wants List separately (marking copied lists with ✓) or export everything combined.
-   - **Add to Cardmarket cart** adds items per seller, then reads back actual cart shipping and remembers tracked-only sellers automatically.
+5. **Deck-Scoped Magic Tokens (Ride-Along):**
+   - Open the **Tokens** tab and paste the Magic tokens you need, grouped by deck with `# Deck Name` headers (add `(no combos)` or toggle the per-deck chip if a deck needs both faces simultaneously).
+   - Instant offline matching against Cardmarket's S3 catalogue (13,000+ single & double-sided tokens/emblems) previews matching printings, within-deck 2-for-1 DFC options, and likely proxies.
+   - **Find tokens at basket sellers** queries **only** your current basket sellers (no new sellers opened; 8-hour cache), enforces your per-face price cap (default **≤ 0,20 €** including any shipping tier jump), combines 2-for-1 double-sided tokens **strictly within the same deck** (never across decks), and lists everything else in a one-click copyable **Proxy / Skip** list with concrete reasons.
+   - Toggle **Include matched tokens in basket & cart** to merge matched tokens directly into seller parcels and add them in the same bulk cart POST.
+6. **Export or Add to Cart:**
+   - **Copy / Export list** exports plain text either combined (grouped per Wants List, Extra Products, and Magic Tokens per deck) or one list at a time (Copy or `.txt` download).
+   - **Copy / Export for Archidekt** exports Magic cards with Scryfall set codes, collector numbers, foil flags, and optional category tags (`[Seller]`, `[Wants List]`, or none; tokens and products are omitted automatically). When multiple Magic Wants Lists are in the basket (or left-out list), a picker modal lets you copy or download each Wants List separately (marking copied lists with ✓) or export everything combined.
+   - **Add to Cardmarket cart** adds items (and included tokens) per seller in one bulk request per seller, then reads back actual cart shipping and remembers tracked-only sellers automatically.
 
 ## Development
 
