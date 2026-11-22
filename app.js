@@ -2583,7 +2583,8 @@
     renderSavedRuns();
   }
 
-  async function openSavedCollection(col, { snapshot = null, source = 'saved run' } = {}) {
+  // autoCompute: false loads the offers only; the user re-optimises explicitly from the notice button.
+  async function openSavedCollection(col, { snapshot = null, source = 'saved run', autoCompute = true } = {}) {
     if (workInProgress()) return;
     if (!Array.isArray(col?.results) || !col.stats?.finishedAt) {
       toast('Not a valid Better Wizard run file.', 'error');
@@ -2597,8 +2598,47 @@
     if (col.selectionSig) await loadLimitsAndCutsFor(col.selectionSig);
     else { state.activeLimits = []; state.manualCuts = []; }
     await updateCachePill();
+    if (!autoCompute) {
+      showLoadedOffersWithoutBasket(col, source);
+      return;
+    }
     await computeBasketFromCollection();
     toast(`Opened run from ${new Date(col.stats.finishedAt).toLocaleString()}.`, 'success');
+  }
+
+  // Shows loaded offers with no basket yet, so an import never silently re-optimises into a different basket.
+  function showLoadedOffersWithoutBasket(col, source) {
+    // Supersede any in-flight optimisation so it cannot render a basket for the previous collection.
+    state.optimiseJobId += 1;
+    state.optimising = false;
+    state.basket = null;
+    state.tokenResult = null;
+    state.removedItems = [];
+    state.removedListOpen = false;
+    state.restoredSnapshot = null;
+    state.leftOut = [];
+    state.cuts = [];
+    state.overlap = [];
+    state.countsByScope = {};
+    state.sellerTokenOffers = {};
+    hideProgress();
+    syncBusyUI();
+    renderTokenResults();
+    $('emptyState').hidden = true;
+    $('resultsArea').hidden = true;
+    $('btnDownload').hidden = false;
+    const when = new Date(col.stats.finishedAt).toLocaleString();
+    $('topNotice').innerHTML = `<div class="alert-banner alert-info" style="margin-bottom:12px">
+      <div><strong>Loaded ${col.results.length} items with offers from ${esc(when)}</strong> (from ${esc(source)}).
+      No usable saved basket was found (e.g. the file was exported before basket snapshots were added), so nothing was computed.
+      Optimising now uses these saved offers (no Cardmarket requests) and may pick a different basket than the one you ordered.</div>
+      <div style="margin-top:8px"><button type="button" id="btnComputeLoaded" class="btn btn-primary btn-sm">Compute basket from these offers</button></div>
+    </div>`;
+    $('btnComputeLoaded').addEventListener('click', () => {
+      if (workInProgress() || state.collection !== col) return;
+      computeBasketFromCollection();
+    });
+    toast(`Loaded offers from ${when}. Click "Compute basket from these offers" to optimise.`, 'success');
   }
 
   // ---- Basket snapshots (exact basket after removals; JSON export, cart add, restore) ----
@@ -2685,8 +2725,8 @@
     if (workInProgress()) return;
     const snap = readBasketSnapshot(raw);
     if (!snap) {
-      toast('The saved basket could not be read; re-optimising from the saved offers instead.', 'error');
-      await openSavedCollection(col, { snapshot: null });
+      toast('The saved basket could not be read; loaded the saved offers only.', 'error');
+      await openSavedCollection(col, { snapshot: null, source, autoCompute: false });
       return;
     }
     // Supersede any in-flight optimisation so its result cannot overwrite the restored basket.
@@ -4197,8 +4237,8 @@
         const parsed = JSON.parse(await file.text());
         const col = parsed.collection || parsed;
         const snapshot = parsed.basketSnapshot && readBasketSnapshot(parsed.basketSnapshot) ? parsed.basketSnapshot : null;
-        if (parsed.basketSnapshot && !snapshot) toast('This file has a basket from an unsupported version; re-optimising instead.', 'error');
-        await openSavedCollection(col, { snapshot, source: `file ${file.name}` });
+        if (parsed.basketSnapshot && !snapshot) toast('This file has a basket from an unsupported version; loaded the saved offers only.', 'error');
+        await openSavedCollection(col, { snapshot, source: `file ${file.name}`, autoCompute: false });
       } catch (error) {
         toast(`Import failed: ${error.message}`, 'error');
       }
