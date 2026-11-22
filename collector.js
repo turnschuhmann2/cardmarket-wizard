@@ -77,7 +77,7 @@
     return {
       idArticle: Number(row.id.replace('articleRow', '')),
       seller: sellerLink.textContent.trim(),
-      location: location.slice('Item location: '.length),
+      location: location.slice('Item location: '.length).trim(),
       professional: sellerTips.includes('Professional') || sellerTips.includes('Powerseller'),
       rating: rating ? rating[1] : null,
       condition: CONDITIONS[condition],
@@ -127,7 +127,7 @@
     return {
       idArticle: Number(row.id.replace('articleRow', '')),
       seller: sellerLink.textContent.trim(),
-      location: location.slice('Item location: '.length),
+      location: location.slice('Item location: '.length).trim(),
       professional: sellerTips.includes('Professional') || sellerTips.includes('Powerseller'),
       rating: rating ? rating[1] : null,
       condition: condition ? CONDITIONS[condition] : 2,
@@ -172,8 +172,13 @@
     const languages = Object.keys(echo.idLanguage || {}).map(Number);
     const problems = [];
     if (query.language != null && (languages.length !== 1 || languages[0] !== query.language)) problems.push('language');
+    const echoCountries = Array.isArray(echo.idCountries)
+      ? echo.idCountries.map(Number)
+      : Object.keys(echo.idCountries || {}).map(Number);
     if (query.sellerCountries?.length &&
-        [...(echo.idCountries || [])].sort().join() !== [...query.sellerCountries].sort().join()) problems.push('seller country');
+        echoCountries.sort((a, b) => a - b).join() !== [...query.sellerCountries].map(Number).sort((a, b) => a - b).join()) {
+      problems.push('seller country');
+    }
     const conditions = echo.condition || CONDITION_CODES;
     if (query.minCondition != null && conditions.join() !== CONDITION_CODES.slice(0, query.minCondition).join()) problems.push('condition');
     if (query.sellerType !== undefined && (echo.sellerStatus || []).join() !== String(query.sellerType)) problems.push('seller type');
@@ -1089,6 +1094,10 @@
     const {
       listId = null, lists = null,
       targetCopies = 5, targetSellers = 3, cutoffFactor = 2, cutoffMarginCents = 50, sellerCountries = [7],
+      domesticCountry = null, domesticLocation = null,
+      domesticMinOffers = 20, domesticProductMinOffers = 35, domesticPageFullThreshold = 45,
+      domesticSellerShare = 0.6,
+      loadShippingTables = null, shippingTables = null,
       minSellers = 40, sellerBatch = 20, sellerLimit = 150, improvementCents = 100, evaluate = null, expansionGroupSize = 12,
       splitBySellerType = false, groupSkipFactor = 1,
       minSellerCards = 2, maxSellerPages = 15,
@@ -1162,9 +1171,19 @@
       return capPrice(entry, target === null ? Infinity : Math.max(target * cutoffFactor, target + cutoffMarginCents));
     };
 
+    const hasFreshCache = key => {
+      const hit = cache?.get(key);
+      return Boolean(hit && Date.now() - hit.at < cacheMaxAgeMs);
+    };
+    const seedDomestic = domesticCountry != null && (
+      sellerCountries.length === 0 ||
+      (sellerCountries.length > 1 && sellerCountries.includes(domesticCountry))
+    );
+    const domesticKeyPart = seedDomestic ? String(domesticCountry) : null;
+
     let done = 0;
     const cardSlot = limiter(2);
-    const countriesKey = [...sellerCountries].sort().join('.');
+    const countriesKey = [...sellerCountries].map(Number).sort((a, b) => a - b).join('.');
     await Promise.all(entries.map(entry => cardSlot(async () => {
       const state = cardState.get(entry.key);
       if (entry.kind === 'product') {
@@ -1179,14 +1198,37 @@
           const page = await cached(key, () => call('productPage', entry, query));
           let kept = 0;
           for (const offer of page.offers) if (keep(entry, offer)) kept += 1;
-          state.cardOffers += kept;
           state.skipped += page.skipped || 0;
           state.pages += 1;
           state.resolvedName = page.meta?.name || entry.name;
           state.resolvedMeta = page.meta || null;
-          state.status = 'read';
           log({ type: 'product-page', product: state.resolvedName, offers: page.offers.length, kept,
             cheapestCents: page.offers[0]?.priceCents ?? null, cached: !!page.fromCache });
+
+          // Multi-country page 1 is sorted by raw item price (excluding shipping), so foreign shops
+          // can crowd domestic sellers off page 1. Merge domestic offers when cached or crowded.
+          if (seedDomestic && !runner.blocked()) {
+            const domKey = ['product', entry.productPath || entry.url, query.language ?? '', domesticKeyPart, query.minCondition].join('|');
+            const rawRows = page.offers.length + (page.skipped || 0);
+            const domCount = domesticLocation ? page.offers.filter(o => o.location === domesticLocation).length : 0;
+            if (hasFreshCache(domKey) || (rawRows >= domesticPageFullThreshold && domCount < domesticProductMinOffers)) {
+              try {
+                const domQuery = { ...query, sellerCountries: [domesticCountry] };
+                const domPage = await cached(domKey, () => call('productPage', entry, domQuery));
+                let domKept = 0;
+                for (const offer of domPage.offers) if (keep(entry, offer)) domKept += 1;
+                state.skipped += domPage.skipped || 0;
+                state.pages += 1;
+                log({ type: 'product-page', product: state.resolvedName, offers: domPage.offers.length, kept: domKept,
+                  cheapestCents: domPage.offers[0]?.priceCents ?? null, cached: !!domPage.fromCache, domesticSeed: true });
+              } catch (seedError) {
+                if (seedError instanceof BlockedError) throw seedError;
+                log({ type: 'product-error', product: entry.name, error: seedError.message, domesticSeed: true });
+              }
+            }
+          }
+          state.cardOffers = offers.get(entry.key).size;
+          state.status = 'read';
         } catch (error) {
           if (error instanceof BlockedError) { state.status = 'blocked'; return; }
           state.status = 'error';
@@ -1225,15 +1267,40 @@
               let kept = 0;
               for (const offer of page.offers) if (keep(entry, offer)) kept += 1;
               const outside = group.products ? page.offers.filter(offer => offer.idProduct !== null && !group.products.has(offer.idProduct)).length : 0;
-              state.cardOffers += kept;
               state.skipped += page.skipped;
               state.pages += 1;
               log({ type: 'card-page', card: entry.name, game: entry.game || 'Magic', language, group: index + 1, groups: groups.length,
                 expansions: group.expansions?.length ?? null, sellerType: sellerType ?? null, offers: page.offers.length, kept,
                 cheapestCents: page.offers[0]?.priceCents ?? null, outsideGroup: outside, skipped: page.skipped, cached: !!page.fromCache });
+
+              // Keep multi-country Phase 1 a superset of domestic sellers on crowded cards (and reuse
+              // any fresh domestic query cache at zero network cost).
+              if (seedDomestic && !runner.blocked()) {
+                const domKey = ['card', entry.cardPath, language, domesticKeyPart, entry.minCondition, entry.foil, entry.signed, entry.altered,
+                  (group.expansions || []).join('.'), sellerType ?? ''].join('|');
+                const rawRows = page.offers.length + (page.skipped || 0);
+                const domCount = domesticLocation ? page.offers.filter(o => o.location === domesticLocation).length : 0;
+                if (hasFreshCache(domKey) || (rawRows >= domesticPageFullThreshold && domCount < domesticMinOffers)) {
+                  try {
+                    const domQuery = { ...query, sellerCountries: [domesticCountry] };
+                    const domPage = await cached(domKey, () => call('cardPage', entry, domQuery));
+                    let domKept = 0;
+                    for (const offer of domPage.offers) if (keep(entry, offer)) domKept += 1;
+                    state.skipped += domPage.skipped;
+                    state.pages += 1;
+                    log({ type: 'card-page', card: entry.name, game: entry.game || 'Magic', language, group: index + 1, groups: groups.length,
+                      expansions: group.expansions?.length ?? null, sellerType: sellerType ?? null, offers: domPage.offers.length, kept: domKept,
+                      cheapestCents: domPage.offers[0]?.priceCents ?? null, skipped: domPage.skipped, cached: !!domPage.fromCache, domesticSeed: true });
+                  } catch (seedError) {
+                    if (seedError instanceof BlockedError) throw seedError;
+                    log({ type: 'card-error', card: entry.name, error: seedError.message, domesticSeed: true });
+                  }
+                }
+              }
             }
           }
         }
+        state.cardOffers = offers.get(entry.key).size;
         state.status = 'read';
       } catch (error) {
         if (error instanceof BlockedError) { state.status = 'blocked'; return; }
@@ -1246,28 +1313,114 @@
       }
     })));
 
+    const observedLocations = [...new Set(sellerLocations.values())];
+    const isMultiCountry = observedLocations.length > 1 ||
+      Boolean(domesticLocation && observedLocations.some(loc => loc !== domesticLocation));
+
+    let resolvedTables = shippingTables;
+    if (isMultiCountry && !resolvedTables && typeof loadShippingTables === 'function') {
+      try {
+        resolvedTables = await loadShippingTables(observedLocations);
+      } catch (error) {
+        log({ type: 'shipping-tables-error', error: error.message });
+        resolvedTables = null;
+      }
+    }
+
+    const minMethodCents = (table, weightGrams, valueCents) => {
+      if (!Array.isArray(table) || !table.length) return Infinity;
+      let best = Infinity;
+      for (const method of table) {
+        if (method.maxWeight >= weightGrams && method.maxValueCents >= valueCents && method.priceCents < best) {
+          best = method.priceCents;
+        }
+      }
+      return best;
+    };
+
+    const excessShippingCents = location => {
+      if (!resolvedTables) return 0;
+      const byLocation = resolvedTables.byLocation || resolvedTables;
+      const domTable = (domesticLocation && byLocation[domesticLocation]) || resolvedTables.default || [];
+      if (location && Object.prototype.hasOwnProperty.call(byLocation, location)) {
+        const table = byLocation[location];
+        if (!Array.isArray(table) || !table.length) return Infinity;
+        const small = minMethodCents(table, 20, 1000);
+        if (!Number.isFinite(small)) return Infinity;
+        const bulkRaw = minMethodCents(table, 50, 3000);
+        const bulk = Number.isFinite(bulkRaw) ? bulkRaw : small * 4;
+        const domSmall = minMethodCents(domTable, 20, 1000);
+        const domBulk = minMethodCents(domTable, 50, 3000);
+        const refSmall = Number.isFinite(domSmall) ? domSmall : 125;
+        const refBulk = Number.isFinite(domBulk) ? domBulk : 395;
+        return Math.max(0, (small - refSmall) * 0.5 + (bulk - refBulk) * 0.5);
+      }
+      return 0;
+    };
+
     const targets = new Map();
     for (const entry of entries) {
       const sorted = [...offers.get(entry.key).values()].sort((a, b) => a.priceCents - b.priceCents);
       const target = targetPrice(sorted, entry.amount, targetCopies, targetSellers);
+      let domesticCutoffCents = null;
+      if (isMultiCountry && domesticLocation) {
+        const domSorted = sorted.filter(o => o.location === domesticLocation);
+        const domTarget = targetPrice(domSorted, entry.amount, targetCopies, targetSellers);
+        domesticCutoffCents = domTarget === null ? null : capPrice(entry, Math.max(domTarget * cutoffFactor, domTarget + cutoffMarginCents));
+      }
       targets.set(entry.key, {
         targetCents: target,
         cutoffCents: target === null ? null : capPrice(entry, Math.max(target * cutoffFactor, target + cutoffMarginCents)),
+        domesticCutoffCents,
       });
     }
 
     // 2. Sellers that are cheap (up to the cutoff) for the most items across all lists & games.
+    //    In multi-country mode, also allow fair domestic offers up to the domestic cutoff and
+    //    rank foreign sellers using a shipping penalty while reserving domestic slots per batch.
     const cheapCards = new Map();
     for (const entry of entries) {
-      const { cutoffCents } = targets.get(entry.key);
+      const { cutoffCents, domesticCutoffCents } = targets.get(entry.key);
       for (const offer of offers.get(entry.key).values()) {
-        if (entry.kind !== 'product' && cutoffCents !== null && offer.priceCents > cutoffCents) continue;
+        const effectiveCutoff = domesticLocation && offer.location === domesticLocation && domesticCutoffCents !== null
+          ? Math.max(cutoffCents ?? 0, domesticCutoffCents)
+          : cutoffCents;
+        if (entry.kind !== 'product' && effectiveCutoff !== null && offer.priceCents > effectiveCutoff) continue;
         if (!cheapCards.has(offer.seller)) cheapCards.set(offer.seller, new Set());
         cheapCards.get(offer.seller).add(entry.key);
       }
     }
-    const chosen = [...cheapCards].map(([seller, keys]) => ({ seller, cheapCards: keys.size }))
-      .filter(row => row.cheapCards >= minSellerCards).sort((a, b) => b.cheapCards - a.cheapCards).slice(0, sellerLimit);
+    const candidateRows = [...cheapCards]
+      .map(([seller, keys]) => {
+        const location = sellerLocations.get(seller) || null;
+        const excessShip = isMultiCountry ? excessShippingCents(location) : 0;
+        const score = Number.isFinite(excessShip) ? keys.size - excessShip / 150 : -Infinity;
+        return { seller, cheapCards: keys.size, ...(location ? { location } : {}), ...(isMultiCountry ? { score: Math.round(score * 100) / 100 } : {}) };
+      })
+      .filter(row => row.cheapCards >= minSellerCards && (row.score === undefined || Number.isFinite(row.score)));
+
+    let chosen;
+    if (isMultiCountry && domesticLocation) {
+      const domQueue = candidateRows.filter(row => row.location === domesticLocation)
+        .sort((a, b) => b.cheapCards - a.cheapCards);
+      const forQueue = candidateRows.filter(row => row.location !== domesticLocation)
+        .sort((a, b) => (b.score ?? b.cheapCards) - (a.score ?? a.cheapCards) || b.cheapCards - a.cheapCards);
+      chosen = [];
+      let d = 0;
+      let f = 0;
+      while (chosen.length < sellerLimit && (d < domQueue.length || f < forQueue.length)) {
+        const wantDomestic = Math.ceil((chosen.length + 1) * domesticSellerShare);
+        if (d < domQueue.length && (d < wantDomestic || f >= forQueue.length)) {
+          chosen.push(domQueue[d++]);
+        } else {
+          chosen.push(forQueue[f++]);
+        }
+      }
+    } else {
+      chosen = candidateRows
+        .sort((a, b) => (b.score ?? b.cheapCards) - (a.score ?? a.cheapCards) || b.cheapCards - a.cheapCards)
+        .slice(0, sellerLimit);
+    }
     log({ type: 'sellers-chosen', sellers: chosen, candidates: cheapCards.size });
 
     const buildResults = () => entries.map(entry => {

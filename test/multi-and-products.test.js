@@ -403,3 +403,203 @@ test('collectBySellers collects across multiple games, multiple lists, and non-c
     { seller: 'CrossShop', listId: '20', game: 'YuGiOh' },
   ]);
 });
+
+test('collectBySellers seeds domestic offers on crowded multi-country pages and reuses domestic 8h cache', async () => {
+  const mkCard = (key, idProduct) => ({
+    key, game: 'Magic', listId: '10', listName: 'EDH', kind: 'card', name: key, amount: 1, anyPrinting: true,
+    cardPath: `/en/Magic/Cards/${key}`, languages: [1], minCondition: 4, foil: 'any', signed: 'any', altered: 'any',
+    printings: [{ idProduct, idExpansion: 1, guideLowCents: 100 }],
+  });
+  const mkProd = () => ({
+    key: 'p:sleeves', game: 'Magic', listId: null, listName: null, kind: 'product', name: 'Sleeves', amount: 1,
+    productPath: '/en/Magic/Products/Sleeves/Test', languages: [], minCondition: 7, printings: [],
+  });
+  const plan = { entries: [mkCard('crowded', 101), mkCard('sparse', 102), mkProd()] };
+
+  // Build 50 foreign offers + 1 German offer on crowded card & product, only 5 offers on sparse card.
+  const foreignCardOffers = Array.from({ length: 50 }, (_, i) => ({
+    idArticle: 1000 + i, seller: `ES_${i}`, location: 'Spain', idProduct: 101, language: 1, condition: 2,
+    foil: false, signed: false, altered: false, priceCents: 100 + i, quantity: 1,
+  }));
+  const deCardOffers = [
+    foreignCardOffers[0], // duplicate idArticle check (cardOffers must stay unique)
+    { idArticle: 2001, seller: 'DE_Shop', location: 'Germany', idProduct: 101, language: 1, condition: 2,
+      foil: false, signed: false, altered: false, priceCents: 180, quantity: 2 },
+  ];
+  const sparseOffers = [
+    { idArticle: 3001, seller: 'ES_0', location: 'Spain', idProduct: 102, language: 1, condition: 2,
+      foil: false, signed: false, altered: false, priceCents: 100, quantity: 1 },
+    { idArticle: 3002, seller: 'DE_Shop', location: 'Germany', idProduct: 102, language: 1, condition: 2,
+      foil: false, signed: false, altered: false, priceCents: 120, quantity: 1 },
+  ];
+  const foreignProdOffers = Array.from({ length: 50 }, (_, i) => ({
+    idArticle: 4000 + i, seller: `ES_P_${i}`, location: 'Spain', idProduct: 900, language: 1, condition: 2,
+    foil: false, signed: false, altered: false, priceCents: 600 + i, shippingCents: 1604, quantity: 1,
+  }));
+  const deProdOffers = [
+    { idArticle: 5001, seller: 'DE_Shop', location: 'Germany', idProduct: 900, language: 1, condition: 2,
+      foil: false, signed: false, altered: false, priceCents: 699, shippingCents: 148, quantity: 3 },
+  ];
+
+  const calls = [];
+  const site = {
+    async cardPage(entry, query) {
+      calls.push(['card', entry.key, query.sellerCountries.join(',')]);
+      if (entry.key === 'sparse') return { offers: sparseOffers, skipped: 0 };
+      if (query.sellerCountries.length === 1 && query.sellerCountries[0] === 7) return { offers: deCardOffers, skipped: 0 };
+      return { offers: foreignCardOffers, skipped: 0 };
+    },
+    async productPage(entry, query) {
+      calls.push(['product', entry.key, query.sellerCountries.join(',')]);
+      if (query.sellerCountries.length === 1 && query.sellerCountries[0] === 7) {
+        return { offers: deProdOffers, skipped: 0, meta: { name: 'Sleeves', game: 'Magic', category: 'Sleeves', idProduct: 900 } };
+      }
+      return { offers: foreignProdOffers, skipped: 0, meta: { name: 'Sleeves', game: 'Magic', category: 'Sleeves', idProduct: 900 } };
+    },
+    async sellerWants() { return { offers: [], skipped: 0, total: 0, hasNext: false }; },
+  };
+
+  const cache = new Map();
+  const eu = [7, 10, 12];
+  const run1 = await collectBySellers(plan, site, {
+    lists: [{ game: 'Magic', listId: '10', listName: 'EDH' }],
+    sellerCountries: eu, domesticCountry: 7, domesticLocation: 'Germany',
+    intervalMs: 0, minSellerCards: 2, cache,
+  });
+
+  // Crowded card and crowded product fetched both EU and domestic [7]; sparse card skipped redundant [7].
+  assert.ok(calls.some(([t, k, c]) => t === 'card' && k === 'crowded' && c === '7'));
+  assert.ok(calls.some(([t, k, c]) => t === 'product' && k === 'p:sleeves' && c === '7'));
+  assert.ok(!calls.some(([t, k, c]) => t === 'card' && k === 'sparse' && c === '7'));
+
+  const crowdedRes = run1.results.find(r => r.key === 'crowded');
+  assert.ok(crowdedRes.offers.some(o => o.seller === 'DE_Shop'), 'domestic seller merged despite page-1 crowding');
+  assert.equal(crowdedRes.cardOffers, crowdedRes.offers.length, 'duplicate idArticles are not double-counted');
+  assert.equal(crowdedRes.sellerOffers, 0);
+
+  const prodRes = run1.results.find(r => r.key === 'p:sleeves');
+  assert.ok(prodRes.offers.some(o => o.seller === 'DE_Shop' && o.shippingCents === 148));
+
+  // Switching to Germany-only now reuses the seeded domestic cache for crowded card & product!
+  calls.length = 0;
+  await collectBySellers(plan, site, {
+    lists: [{ game: 'Magic', listId: '10', listName: 'EDH' }],
+    sellerCountries: [7], domesticCountry: 7, domesticLocation: 'Germany',
+    intervalMs: 0, minSellerCards: 2, cache,
+  });
+  assert.ok(!calls.some(([t, k]) => t === 'card' && k === 'crowded'), 'crowded card served from shared domestic cache');
+  assert.ok(!calls.some(([t, k]) => t === 'product' && k === 'p:sleeves'), 'product served from shared domestic cache');
+  assert.ok(calls.some(([t, k]) => t === 'card' && k === 'sparse'), 'sparse card fetched once for DE-only');
+});
+
+test('collectBySellers Phase 2 ranks sellers shipping-aware, reserves domestic slots, and skips failed countries', async () => {
+  const entries = Array.from({ length: 6 }, (_, i) => ({
+    key: `c${i}`, game: 'Magic', listId: '10', listName: 'EDH', kind: 'card', name: `Card ${i}`, amount: 1, anyPrinting: true,
+    cardPath: `/en/Magic/Cards/C${i}`, languages: [1], minCondition: 4, foil: 'any', signed: 'any', altered: 'any',
+    printings: [{ idProduct: i + 1, idExpansion: 1, guideLowCents: 100 }],
+  }));
+  const jpTable = [{ name: 'JP Courier', tracked: true, maxWeight: 2000, maxValueCents: 50000, priceCents: 3871, isLetter: false }];
+  const tables = {
+    default: deTable,
+    defaultLocation: 'Germany',
+    byLocation: { Germany: deTable, Austria: atTable, Japan: jpTable, BrokenLand: [] },
+  };
+
+  let id = 10000;
+  const cardOffers = Object.fromEntries(entries.map((e, i) => [e.key, [
+    // Japan & BrokenLand have ALL 6 cards at lowest raw price; Austria has 4; Germany sellers have 3 each.
+    { idArticle: id++, seller: 'JP_Mega', location: 'Japan', idProduct: i + 1, language: 1, condition: 2, foil: false, signed: false, altered: false, priceCents: 90, quantity: 1 },
+    { idArticle: id++, seller: 'Broken_Mega', location: 'BrokenLand', idProduct: i + 1, language: 1, condition: 2, foil: false, signed: false, altered: false, priceCents: 85, quantity: 1 },
+    ...(i < 4 ? [{ idArticle: id++, seller: 'AT_Shop', location: 'Austria', idProduct: i + 1, language: 1, condition: 2, foil: false, signed: false, altered: false, priceCents: 95, quantity: 1 }] : []),
+    ...(i < 3 ? [
+      { idArticle: id++, seller: 'DE_1', location: 'Germany', idProduct: i + 1, language: 1, condition: 2, foil: false, signed: false, altered: false, priceCents: 110, quantity: 1 },
+      { idArticle: id++, seller: 'DE_2', location: 'Germany', idProduct: i + 1, language: 1, condition: 2, foil: false, signed: false, altered: false, priceCents: 115, quantity: 1 },
+    ] : []),
+  ]]));
+
+  const asked = [];
+  const site = {
+    async cardPage(entry) { return { offers: cardOffers[entry.key], skipped: 0 }; },
+    async sellerWants(seller) { asked.push(seller); return { offers: [], skipped: 0, total: 0, hasNext: false }; },
+  };
+
+  await collectBySellers({ entries }, site, {
+    lists: [{ game: 'Magic', listId: '10', listName: 'EDH' }],
+    sellerCountries: [1, 7, 36], domesticCountry: 7, domesticLocation: 'Germany',
+    loadShippingTables: async () => tables,
+    minSellers: 3, sellerLimit: 3, minSellerCards: 2, intervalMs: 0,
+  });
+
+  // Top 3 sellers must include both German sellers (60% share -> 2 of 3) + Austria (beats Japan's 38.71 EUR penalty),
+  // and must never waste a Phase-2 query on BrokenLand (empty shipping table).
+  assert.ok(!asked.includes('Broken_Mega'), 'country with empty shipping table is skipped');
+  assert.ok(asked.includes('DE_1') && asked.includes('DE_2'), 'domestic sellers get reserved Phase-2 slots');
+  assert.ok(asked.includes('AT_Shop'), 'moderate-shipping Austria beats 38.71 EUR Japan');
+  assert.ok(!asked.includes('JP_Mega'), 'Japan penalized below Austria');
+});
+
+test('wizard rank() never strands items across the 25 EUR shipping cliff and multi-country optimise() beats high-cliff foreign traps', async () => {
+  // 1. Single seller with 10 x 3,30 EUR cards (33 EUR > 25 EUR cliff) must assign all 10 cards, 0 missing.
+  const singleSellerCol = {
+    results: Array.from({ length: 10 }, (_, i) => ({
+      key: `c${i}`, name: `Card ${i}`, amount: 1, kind: 'card', game: 'Magic', targetCents: 330, verdict: 'read',
+      offers: [offer('GermanBulk', 330, { idProduct: i + 1, location: 'Germany' })],
+    })),
+  };
+  const singleBasket = createPlanner(singleSellerCol, deTable).basket();
+  assert.equal(singleBasket.missing.length, 0);
+  assert.equal(singleBasket.parcels[0].items.length, 10);
+  assert.equal(singleBasket.totalCents, 3300 + 395);
+
+  // 2. Multi-country trap: Spain has all 10 cards at 3,00 EUR (30 EUR -> 16,04 EUR tracked = 46,04 EUR),
+  //    while Germany has all 10 at 3,30 EUR (33 EUR -> 3,95 EUR tracked = 36,95 EUR).
+  //    Mixed split (8 cards ES @ 3,00 = 24,00 + 2,60 = 26,60 + 2 cards DE @ 3,30 = 6,60 + 1,25 = 7,85 -> 34,45 EUR) is even cheaper!
+  const esTable = [
+    { name: 'ES Letter 50g', tracked: false, maxWeight: 50, maxValueCents: 2500, priceCents: 260, isLetter: true },
+    { name: 'ES Tracked 250g', tracked: true, maxWeight: 250, maxValueCents: 50000, priceCents: 1604, isLetter: true },
+  ];
+  const tables = { default: deTable, defaultLocation: 'Germany', byLocation: { Germany: deTable, Spain: esTable } };
+  const trapCol = {
+    results: Array.from({ length: 10 }, (_, i) => ({
+      key: `c${i}`, name: `Card ${i}`, amount: 1, kind: 'card', game: 'Magic', targetCents: 300, verdict: 'read',
+      offers: [
+        offer('SpainBulk', 300, { idProduct: i + 1, location: 'Spain' }),
+        offer('GermanBulk', 330, { idProduct: i + 1, location: 'Germany' }),
+      ],
+    })),
+  };
+  const planner = createPlanner(trapCol, tables);
+  const quick = planner.basket();
+  const opt = await planner.optimise(quick, { timeMs: 600 });
+  assert.equal(opt.missing.length, 0);
+  assert.ok(opt.totalCents <= 3695, `multi-country basket (${opt.totalCents}) must never exceed DE-only (3695)`);
+  assert.equal(opt.totalCents, 3445, 'relieves 25 EUR Spain cliff by offloading 2 cards to Germany');
+});
+
+test('parseOfferRow and parseProductOfferRow trim location whitespace', () => {
+  const { parseOfferRow } = globalThis.CardmarketCollector;
+  const makeEl = ({ text = '', attrs = {}, cls = '', children = {} } = {}) => ({
+    id: attrs.id || '',
+    textContent: text,
+    className: cls,
+    getAttribute: name => attrs[name] ?? null,
+    querySelector: sel => children[sel] || null,
+    querySelectorAll: sel => {
+      if (sel.startsWith('.col-seller')) return [makeEl({ attrs: { title: 'Item location: Germany  ' } })];
+      if (sel.startsWith('.product-attributes')) return [makeEl({ attrs: { title: 'Near Mint' } }), makeEl({ attrs: { title: 'English' } })];
+      return [];
+    },
+    closest: () => makeEl({ text: '1,48 €' }),
+  });
+  const row = makeEl({
+    attrs: { id: 'articleRow12345' },
+    children: {
+      '.seller-name a[href*="/Users/"]': makeEl({ text: 'TestSeller' }),
+      '.price-container .color-primary': makeEl({ text: '1,50 €' }),
+      '.price-container': makeEl({ text: '1,50 € 1,48 €' }),
+      '.amount-container .item-count': makeEl({ text: '2' }),
+    },
+  });
+  assert.equal(parseOfferRow(row).location, 'Germany');
+  assert.equal(parseProductOfferRow(row).location, 'Germany');
+});

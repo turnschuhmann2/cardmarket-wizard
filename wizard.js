@@ -241,13 +241,14 @@
   // Normalises either a single shipping table (Method[]) or a per-country table map
   // ({ default?: Method[], byLocation?: { [name]: Method[] } } or { [name]: Method[] }).
   function normaliseTables(tableOrMap) {
-    if (Array.isArray(tableOrMap)) return { defaultTable: tableOrMap, byLocation: {} };
+    if (Array.isArray(tableOrMap)) return { defaultTable: tableOrMap, defaultLocation: null, byLocation: {} };
     if (tableOrMap && typeof tableOrMap === 'object') {
       const byLocation = tableOrMap.byLocation || tableOrMap;
       const defaultTable = tableOrMap.default || Object.values(byLocation).find(Array.isArray) || [];
-      return { defaultTable, byLocation };
+      const defaultLocation = typeof tableOrMap.defaultLocation === 'string' ? tableOrMap.defaultLocation : null;
+      return { defaultTable, defaultLocation, byLocation };
     }
-    return { defaultTable: [], byLocation: {} };
+    return { defaultTable: [], defaultLocation: null, byLocation: {} };
   }
 
   // Seller-search strategies raced by optimise (see search() for what each setting does).
@@ -261,7 +262,7 @@
   // trackedOnly: sellers who may only ship tracked (learned from the cart: Cardmarket makes tracked
   // shipping mandatory for some sellers, e.g. new ones or ones with a high loss rate).
   function createPlanner(collection, tableOrMap, { trackedOnly = [] } = {}) {
-    const { defaultTable, byLocation } = normaliseTables(tableOrMap);
+    const { defaultTable, defaultLocation, byLocation } = normaliseTables(tableOrMap);
     const trackedSellers = new Set(trackedOnly);
     const trackedCache = new WeakMap();
     const onlyTracked = table => {
@@ -272,6 +273,25 @@
     const units = unitsOf(collection);
     const { sellers, sellerLocations } = offersBySeller(collection);
     const unitById = new Map(units.map(unit => [unit.id, unit]));
+
+    const uniqueLocations = [...new Set([...sellerLocations.values()].filter(Boolean))];
+    const hasMultipleLocations = uniqueLocations.length > 1;
+    let domesticLocation = defaultLocation && uniqueLocations.includes(defaultLocation) ? defaultLocation : null;
+    if (!domesticLocation && hasMultipleLocations) {
+      let bestCost = Infinity;
+      let bestTracked = Infinity;
+      for (const loc of uniqueLocations) {
+        const tbl = byLocation[loc];
+        if (!Array.isArray(tbl) || !tbl.length) continue;
+        const small = shipping(tbl, 1, 100)?.priceCents ?? Infinity;
+        const tracked = shipping(tbl, 15, 3000)?.priceCents ?? Infinity;
+        if (small < bestCost || (small === bestCost && tracked < bestTracked)) {
+          bestCost = small;
+          bestTracked = tracked;
+          domesticLocation = loc;
+        }
+      }
+    }
 
     const tableFor = seller => {
       const location = sellerLocations.get(seller);
@@ -314,15 +334,15 @@
       return null;
     }
 
-    function rank() {
+    function rank(allowedSellers = null) {
       const assignment = new Map();
-      const order = [];
+      const assignedBySeller = new Map();
       const open = new Set(units.map(unit => unit.id));
       for (;;) {
         let best = null;
         const taken = used(assignment);
         for (const [seller, byKey] of sellers) {
-          if (order.includes(seller)) continue;
+          if (allowedSellers && !allowedSellers.has(seller)) continue;
           const picks = [];
           const local = new Map(taken);
           for (const unitId of open) {
@@ -333,23 +353,36 @@
             local.set(offer.idArticle, (local.get(offer.idArticle) || 0) + 1);
             picks.push({ unitId, unit, offer, extra: offer.priceCents - (unit.targetCents ?? offer.priceCents) });
           }
+          if (!picks.length) continue;
           picks.sort((a, b) => a.extra - b.extra);
+          const existing = assignedBySeller.get(seller);
+          const baseItems = existing ? existing.items : [];
+          const baseValue = existing ? existing.value : 0;
+          const baseShip = existing ? existing.ship : 0;
           let extra = 0;
           let value = 0;
           const sellerTable = tableFor(seller);
-          const prefix = [];
+          const combined = baseItems.slice();
           picks.forEach((pick, index) => {
             extra += pick.extra;
             value += pick.offer.priceCents;
-            prefix.push(pick);
-            const method = parcelShipping(sellerTable, prefix, value);
+            combined.push(pick);
+            const method = parcelShipping(sellerTable, combined, baseValue + value);
             if (!method) return;
-            const perCard = (extra + method.priceCents) / (index + 1);
-            if (!best || perCard < best.perCard) best = { seller, perCard, picks: picks.slice(0, index + 1) };
+            const marginalShip = method.priceCents - baseShip;
+            const perCard = (extra + marginalShip) / (index + 1);
+            if (!best || perCard < best.perCard) {
+              best = {
+                seller, perCard, picks: picks.slice(0, index + 1),
+                newValue: baseValue + value, newShip: method.priceCents,
+              };
+            }
           });
         }
         if (!best) break;
-        order.push(best.seller);
+        const prev = assignedBySeller.get(best.seller);
+        const items = prev ? prev.items.concat(best.picks) : best.picks.slice();
+        assignedBySeller.set(best.seller, { items, value: best.newValue, ship: best.newShip });
         for (const pick of best.picks) {
           assignment.set(pick.unitId, { seller: best.seller, offer: pick.offer });
           open.delete(pick.unitId);
@@ -497,13 +530,86 @@
       return assignment;
     }
 
+    // When a mixed seller set pushes an international/heavy parcel across a sharp shipping cliff
+    // (e.g. >25 EUR tracked ES/IT/PL or 5+ cards NL), assignWithin's raw-price greedy rule never
+    // offloads items to a slightly dearer domestic seller. This fast check only activates when a
+    // parcel pays >= 5,00 EUR shipping, so low-shipping domestic runs pay zero overhead.
+    function relieveCliffs(assignment, chosen) {
+      const list = parcels(assignment);
+      let currentCost = list.reduce((sum, parcel) => sum + parcel.itemsCents + parcel.shippingCents, 0);
+      if (chosen.size <= 1) return { assignment, cost: currentCost };
+      const expensive = list.filter(parcel => parcel.shippingCents >= 500).sort((a, b) => b.shippingCents - a.shippingCents);
+      if (!expensive.length) return { assignment, cost: currentCost };
+
+      let current = assignment;
+      const others = [...chosen];
+      for (const parcel of expensive) {
+        const movables = [];
+        const baseTaken = used(current);
+        for (const [unitId, pick] of current) {
+          if (pick.seller !== parcel.seller) continue;
+          const unit = unitById.get(unitId);
+          let bestAlt = null;
+          for (const altSeller of others) {
+            if (altSeller === parcel.seller) continue;
+            const offer = cheapestCopy(altSeller, unit.key, baseTaken);
+            if (offer && (!bestAlt || offer.priceCents < bestAlt.offer.priceCents)) bestAlt = { seller: altSeller, offer };
+          }
+          if (bestAlt) movables.push({ unitId, premium: bestAlt.offer.priceCents - pick.offer.priceCents });
+        }
+        if (!movables.length) continue;
+        movables.sort((a, b) => a.premium - b.premium);
+        const trial = new Map(current);
+        let bestTrial = null;
+        let bestCost = currentCost;
+        const limit = Math.min(movables.length, 8);
+        for (let i = 0; i < limit; i += 1) {
+          const { unitId } = movables[i];
+          const unit = unitById.get(unitId);
+          const taken = used(trial, unitId);
+          let alt = null;
+          for (const altSeller of others) {
+            if (altSeller === parcel.seller) continue;
+            const offer = cheapestCopy(altSeller, unit.key, taken);
+            if (offer && (!alt || offer.priceCents < alt.offer.priceCents)) alt = { seller: altSeller, offer };
+          }
+          if (!alt) continue;
+          trial.set(unitId, alt);
+          const trialCost = total(trial);
+          if (trialCost < bestCost) {
+            bestCost = trialCost;
+            bestTrial = new Map(trial);
+          }
+        }
+        if (bestTrial) {
+          current = bestTrial;
+          currentCost = bestCost;
+        }
+      }
+      return { assignment: current, cost: currentCost };
+    }
+
     // An item nobody among the chosen sellers has counts as very expensive, so a seller set that
     // leaves items out never wins.
     const MISSING_CENTS = 100000;
     const costOf = chosen => {
-      const assignment = assignWithin(chosen);
-      return { assignment, cents: total(assignment) + (units.length - assignment.size) * MISSING_CENTS };
+      const { assignment, cost } = relieveCliffs(assignWithin(chosen), chosen);
+      return { assignment, cents: cost + (units.length - assignment.size) * MISSING_CENTS };
     };
+
+    function domesticBaselineAssignment() {
+      if (!hasMultipleLocations || !domesticLocation) return null;
+      const domSellers = new Set([...sellers.keys()].filter(s => sellerLocations.get(s) === domesticLocation));
+      if (!domSellers.size) return null;
+      return improve(rank(domSellers));
+    }
+
+    function quickAssignment() {
+      const all = improve(rank());
+      const dom = domesticBaselineAssignment();
+      if (dom && (dom.size > all.size || (dom.size === all.size && total(dom) < total(all)))) return dom;
+      return all;
+    }
 
     // Small deterministic random generator, so reopening a run gives the same basket.
     function random(seed) {
@@ -517,42 +623,68 @@
 
     const pause = () => new Promise(resolve => setTimeout(resolve, 0));
 
-    async function search(basket, { seed = 1, shake = 3, breadth = 150, start = 'basket' }, deadline, isCancelled = () => false) {
+    async function search(basket, { seed = 1, shake = 3, breadth = 150, start = 'basket', startSellers = null }, deadline, isCancelled = () => false) {
       const next = random(seed);
       const candidates = [...sellers.keys()];
       const timeLeft = () => !isCancelled() && Date.now() < deadline;
 
       function helpful(assignment) {
-        const paid = new Map();
+        const rawPaid = new Map();
+        const landedPaid = new Map();
+        const shipShareBySeller = new Map();
+        for (const parcel of parcels(assignment)) {
+          shipShareBySeller.set(parcel.seller, parcel.items.length ? parcel.shippingCents / parcel.items.length : 0);
+        }
         for (const unit of units) {
-          const price = assignment.get(unit.id)?.offer.priceCents ?? MISSING_CENTS;
-          paid.set(unit.key, Math.max(paid.get(unit.key) ?? 0, price));
+          const pick = assignment.get(unit.id);
+          const raw = pick ? pick.offer.priceCents : MISSING_CENTS;
+          const landed = pick ? raw + (shipShareBySeller.get(pick.seller) || 0) : MISSING_CENTS;
+          rawPaid.set(unit.key, Math.max(rawPaid.get(unit.key) ?? 0, raw));
+          landedPaid.set(unit.key, Math.max(landedPaid.get(unit.key) ?? 0, landed));
         }
         const scored = [];
         for (const seller of candidates) {
-          let saving = 0;
-          for (const [key, list] of sellers.get(seller)) if (paid.has(key) && list[0].priceCents < paid.get(key)) saving += paid.get(key) - list[0].priceCents;
-          if (saving > 0) scored.push([saving, seller]);
+          let rawSaving = 0;
+          let landedGross = 0;
+          let matchedCount = 0;
+          let matchedValue = 0;
+          for (const [key, list] of sellers.get(seller)) {
+            const p = list[0].priceCents;
+            if (rawPaid.has(key) && p < rawPaid.get(key)) rawSaving += rawPaid.get(key) - p;
+            if (landedPaid.has(key) && p < landedPaid.get(key)) {
+              landedGross += landedPaid.get(key) - p;
+              matchedCount += 1;
+              matchedValue += p;
+            }
+          }
+          let netLanded = 0;
+          if (matchedCount > 0) {
+            const candShip = shipping(tableFor(seller), matchedCount, matchedValue)?.priceCents ?? Infinity;
+            if (Number.isFinite(candShip) && landedGross > candShip) netLanded = landedGross - candShip;
+          }
+          const score = netLanded + rawSaving;
+          if (score > 0) scored.push([score, seller]);
         }
         return scored.sort((a, b) => b[0] - a[0]).slice(0, breadth).map(([, seller]) => seller);
       }
 
       async function polish(from) {
         let chosen = new Set(from);
-        let current = costOf(chosen).cents;
+        let currentState = costOf(chosen);
+        let current = currentState.cents;
         for (let improved = true; improved && timeLeft();) {
           improved = false;
           for (const seller of [...chosen]) {
             const trial = new Set(chosen);
             trial.delete(seller);
-            const cents = costOf(trial).cents;
-            if (cents < current) { current = cents; chosen = trial; improved = true; }
+            const state = costOf(trial);
+            if (state.cents < current) { current = state.cents; currentState = state; chosen = trial; improved = true; }
           }
-          for (const [index, seller] of helpful(assignWithin(chosen)).entries()) {
+          for (const [index, seller] of helpful(currentState.assignment).entries()) {
             if (chosen.has(seller)) continue;
             const trial = new Set(chosen).add(seller);
-            const cents = costOf(trial).cents;
-            if (cents < current) { current = cents; chosen = trial; improved = true; }
+            const state = costOf(trial);
+            if (state.cents < current) { current = state.cents; currentState = state; chosen = trial; improved = true; }
             if (index % 200 === 0) { await pause(); if (!timeLeft()) break; }
           }
           if (improved || !timeLeft()) continue;
@@ -560,11 +692,12 @@
           for (const out of [...chosen]) {
             const without = new Set(chosen);
             without.delete(out);
-            for (const [index, seller] of helpful(assignWithin(without)).entries()) {
+            const withoutState = costOf(without);
+            for (const [index, seller] of helpful(withoutState.assignment).entries()) {
               if (chosen.has(seller)) continue;
               const trial = new Set(without).add(seller);
-              const cents = costOf(trial).cents;
-              if (cents < current) { current = cents; chosen = trial; improved = true; break; }
+              const state = costOf(trial);
+              if (state.cents < current) { current = state.cents; currentState = state; chosen = trial; improved = true; break; }
               if (index % 200 === 0) { await pause(); if (!timeLeft()) break; }
             }
             if (improved || !timeLeft()) break;
@@ -573,7 +706,12 @@
         return { chosen, cents: current };
       }
 
-      let best = await polish(start === 'empty' ? [] : basket.parcels.map(parcel => parcel.seller));
+      const initialSellers = Array.isArray(startSellers)
+        ? startSellers
+        : start === 'empty'
+          ? []
+          : basket.parcels.map(parcel => parcel.seller);
+      let best = await polish(initialSellers);
       while (timeLeft()) {
         const shaken = [...best.chosen];
         for (let i = 0; i < shake && shaken.length; i += 1) shaken.splice(Math.floor(next() * shaken.length), 1);
@@ -586,10 +724,20 @@
 
     async function optimise(basket, { timeMs = 10000, strategies = STRATEGIES, onProgress = () => {}, isCancelled = () => false } = {}) {
       const initialCents = total(basket.assignment) + (units.length - basket.assignment.size) * MISSING_CENTS;
-      const share = timeMs / strategies.length;
+      const runStrategies = [...strategies];
+      const domBaseline = strategies === STRATEGIES ? domesticBaselineAssignment() : null;
+      if (domBaseline && domBaseline.size >= basket.assignment.size) {
+        const domSellers = [...new Set([...domBaseline.values()].map(pick => pick.seller))];
+        runStrategies.push({ name: 'domestic first', seed: 5, shake: 3, breadth: 150, startSellers: domSellers });
+      }
+      const share = timeMs / runStrategies.length;
       const results = [];
       let best = null;
-      for (const strategy of strategies) {
+      if (domBaseline && domBaseline.size >= basket.assignment.size) {
+        const domCents = total(domBaseline) + (units.length - domBaseline.size) * MISSING_CENTS;
+        if (domCents < initialCents) best = { cents: domCents, assignment: domBaseline, strategy: 'domestic baseline' };
+      }
+      for (const strategy of runStrategies) {
         if (isCancelled()) break;
         const started = Date.now();
         const found = await search(basket, strategy, started + share, isCancelled);
@@ -598,7 +746,7 @@
         const cents = total(assignment) + (units.length - assignment.size) * MISSING_CENTS;
         results.push({ strategy: strategy.name, cents, sellers: new Set([...assignment.values()].map(pick => pick.seller)).size, ms: Date.now() - started });
         if (!best || cents < best.cents) best = { cents, assignment, strategy: strategy.name };
-        onProgress({ cents: best.cents, sellers: results.at(-1).sellers, strategy: strategy.name, done: results.length, of: strategies.length });
+        onProgress({ cents: best.cents, sellers: results.at(-1).sellers, strategy: strategy.name, done: results.length, of: runStrategies.length });
       }
       // Superseded jobs stop early with nothing better than what came in.
       if (!best) return Object.assign(basket, { search: { results, winner: 'quick basket', quickCents: initialCents } });
@@ -651,7 +799,7 @@
       return cuts;
     }
 
-    return { basket: () => describe(improve(rank())), optimise, revalidate, recommendCuts, topUp, apply, overlap };
+    return { basket: () => describe(quickAssignment()), optimise, revalidate, recommendCuts, topUp, apply, overlap };
   }
 
   function allocateIntegerCents(totalCents, weightedItems) {

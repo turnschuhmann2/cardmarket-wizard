@@ -31,7 +31,9 @@
   const COUNTRY_ID_BY_NAME = Object.fromEntries(COUNTRIES.map(([id, name]) => [name, id]));
   const COUNTRY_NAME_BY_ID = Object.fromEntries(COUNTRIES);
   const NEIGHBOURS = [7, 1, 23, 2, 12, 4, 6, 25, 8, 20];
-  const EU_IDS = COUNTRIES.filter(([id]) => ![36, 29].includes(id)).map(([id]) => id);
+  const NON_EUROPE_IDS = [36, 29]; // Japan, Singapore
+  const NON_EU_CUSTOMS_IDS = [13, 4, 24, 37, 18]; // UK, Switzerland, Norway, Iceland, Liechtenstein
+  const EU_IDS = COUNTRIES.filter(([id]) => !NON_EUROPE_IDS.includes(id) && !NON_EU_CUSTOMS_IDS.includes(id)).map(([id]) => id);
   const THOROUGH = { splitBySellerType: true, groupSkipFactor: 3, minSellers: 80, sellerBatch: 20, sellerLimit: 200, improvementCents: 20 };
   const LIMIT_CANDIDATES = [50, 100, 200, 300, 500, 1000, 2000];
   const TRACKED_MEMORY_MS = 30 * 24 * 60 * 60 * 1000;
@@ -222,7 +224,11 @@
   // ---- Selection & Cache Signature ----
   function getSellerCountries() {
     if (state.regionMode === 'de') return [7];
-    if (state.regionMode === 'eu') return [];
+    if (state.regionMode === 'eu') {
+      // Explicit EU single-market filter (+ shipTo if shipping to a non-EU country like CH/UK/NO)
+      // so non-EU / worldwide sellers (JP, SG, UK, CH, NO) never crowd out page-1 offers.
+      return [...new Set([...EU_IDS, state.shipTo])].sort((a, b) => a - b);
+    }
     return [...new Set(state.customCountries)].sort((a, b) => a - b);
   }
 
@@ -238,7 +244,12 @@
   function selectionSignature() {
     const listsPart = getSelectedListObjects().map(l => `${l.game}:${l.listId}`).sort().join(',');
     const prodsPart = getEnabledProducts().map(p => `${p.productPath}x${p.amount || 1}`).sort().join(',');
-    const regionPart = state.regionMode === 'eu' ? 'eu' : getSellerCountries().join('.');
+    const countries = getSellerCountries();
+    const regionPart = state.regionMode === 'eu'
+      ? `eu2:${state.shipTo}`
+      : countries.length > 1 && countries.includes(state.shipTo)
+        ? `${countries.join('.')}:d${state.shipTo}`
+        : countries.join('.');
     return `${listsPart}|${prodsPart}|${regionPart}`;
   }
 
@@ -360,7 +371,7 @@
     if (failed.includes(defaultCountry) || !defaultTable?.length) {
       throw new Error(`Shipping tables: no shipping rates available for ${defaultCountry}.`);
     }
-    return { default: defaultTable, byLocation, failed };
+    return { default: defaultTable, defaultLocation: defaultCountry, byLocation, failed };
   }
 
   // ---- Offer Query Cache (8h TTL for automatic reuse) ----
@@ -1969,6 +1980,22 @@
       };
 
       const planObj = { entries: combinedEntries };
+      const domesticCountry = state.shipTo;
+      const domesticLocation = COUNTRY_NAME_BY_ID[state.shipTo] || 'Germany';
+      const loadShippingTables = async locations => {
+        const unseen = (locations || []).filter(loc => loc && COUNTRY_ID_BY_NAME[loc] && !triedLocations.has(loc));
+        if (unseen.length) {
+          try {
+            const synthetic = { results: [{ offers: [...triedLocations, ...unseen].map(location => ({ location })) }] };
+            evalTables = await loadShippingTablesFor(synthetic);
+            for (const location of unseen) triedLocations.add(location);
+          } catch (error) {
+            record({ type: 'error', message: error.message });
+          }
+        }
+        return evalTables;
+      };
+
       const evaluate = async results => {
         // Sellers found since the last batch may ship from countries we have no table for yet.
         const unseen = new Set();
@@ -1999,6 +2026,9 @@
         : await collectBySellers(planObj, site, {
             ...common,
             lists: selectedLists,
+            domesticCountry,
+            domesticLocation,
+            loadShippingTables,
             evaluate,
             ...(state.method === 'thorough' ? THOROUGH : {}),
           });
@@ -3112,6 +3142,7 @@
       if (workInProgress()) { $('shipTo').value = state.shipTo; return; }
       state.shipTo = Number($('shipTo').value);
       await saveSettings();
+      await updateCachePill();
       if (state.collection) await computeBasketFromCollection();
     });
     $('method').addEventListener('change', async () => { state.method = $('method').value; await saveSettings(); });
