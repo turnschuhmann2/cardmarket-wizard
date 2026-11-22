@@ -55,8 +55,11 @@
             for (const [k, v] of message.formEntries) body.append(k, v);
             init.body = body;
           }
+          const t0 = Date.now();
           const response = await fetch(target.href, init);
+          const tHeaders = Date.now();
           const text = await response.text();
+          const tBody = Date.now();
           reply({
             ok: response.ok,
             status: response.status,
@@ -65,6 +68,11 @@
             headers: {
               'cf-mitigated': response.headers.get('cf-mitigated'),
               'retry-after': response.headers.get('retry-after'),
+            },
+            timing: {
+              fetchMs: tBody - t0,
+              headersMs: tHeaders - t0,
+              bodyMs: tBody - tHeaders,
             },
             text,
           });

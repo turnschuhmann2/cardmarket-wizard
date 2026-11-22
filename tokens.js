@@ -952,9 +952,24 @@
   }
 
   // Non-destructively merges matched tokens into a copy of the basket (for UI, KPIs, and cart add).
-  function mergeTokensIntoBasket(basket, tokenResult) {
+  function mergeTokensIntoBasket(basket, tokenResult, options = {}) {
     if (!basket || !tokenResult || !tokenResult.assignments?.length) return basket;
     const bySeller = tokenResult.bySeller || new Map();
+    const { tables = null, trackedOnly = [], parcelShippingFn = null } = options || {};
+    const trackedSet = new Set(trackedOnly || []);
+    const hasRecalc = Boolean(tables && typeof parcelShippingFn === 'function');
+    const byLocation = tables && !Array.isArray(tables) ? (tables.byLocation || tables) : {};
+    const defaultTable = Array.isArray(tables)
+      ? tables
+      : tables?.default || Object.values(byLocation).find(Array.isArray) || null;
+    const tableForParcel = parcel => {
+      if (!defaultTable) return null;
+      const base = (parcel.location && byLocation[parcel.location]) || defaultTable;
+      return trackedSet.has(parcel.seller) ? base.filter(m => m.tracked) : base;
+    };
+
+    let mergedTokensCents = 0;
+    let mergedShippingDeltaCents = 0;
 
     const parcels = basket.parcels.map(parcel => {
       const add = bySeller.get(parcel.seller);
@@ -980,14 +995,40 @@
 
       const items = [...parcel.items, ...tokenItems];
       const games = [...new Set([...(parcel.games || []), 'Magic'])];
+      const itemsCents = parcel.itemsCents + add.tokensCents;
+      let shippingCents = Number.isFinite(add.newShippingCents) ? add.newShippingCents : parcel.shippingCents;
+      let method = add.newMethod || parcel.method;
+      let shipDelta = add.shippingDeltaCents || 0;
+
+      if (hasRecalc) {
+        const tbl = tableForParcel(parcel);
+        if (tbl && tbl.length) {
+          const simItems = items.map(it => ({
+            kind: it.kind === 'token' ? 'card' : (it.kind || 'card'),
+            offer: { shippingCents: it.offerShippingCents ?? null },
+          }));
+          const recalc = parcelShippingFn(tbl, simItems, itemsCents);
+          if (recalc && Number.isFinite(recalc.priceCents)) {
+            shippingCents = recalc.priceCents;
+            method = recalc.name || method;
+            if (Number.isFinite(parcel.shippingCents)) {
+              shipDelta = Math.max(0, shippingCents - parcel.shippingCents);
+            }
+          }
+        }
+      }
+
+      mergedTokensCents += add.tokensCents;
+      mergedShippingDeltaCents += shipDelta;
+
       return {
         ...parcel,
         games,
         hasTokens: true,
         tokenCount: tokenItems.length,
-        itemsCents: parcel.itemsCents + add.tokensCents,
-        shippingCents: Number.isFinite(add.newShippingCents) ? add.newShippingCents : parcel.shippingCents,
-        method: add.newMethod || parcel.method,
+        itemsCents,
+        shippingCents,
+        method,
         items,
       };
     });
@@ -1000,13 +1041,22 @@
       return { sellers: index + 1, cards, totalCents: running };
     });
 
+    const tokenStats = hasRecalc && tokenResult.stats
+      ? {
+        ...tokenResult.stats,
+        tokensCents: mergedTokensCents,
+        shippingDeltaCents: mergedShippingDeltaCents,
+        totalAddedCents: mergedTokensCents + mergedShippingDeltaCents,
+      }
+      : tokenResult.stats;
+
     return {
       ...basket,
       parcels,
       curve,
       totalCents: running,
       shippingCents: parcels.reduce((s, p) => s + p.shippingCents, 0),
-      tokenStats: tokenResult.stats,
+      tokenStats,
     };
   }
 

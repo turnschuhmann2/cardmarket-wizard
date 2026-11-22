@@ -614,3 +614,49 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); f
 .removed-item-info { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
 .removed-item-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 .removed-item-price { color: var(--text-muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+
+
+/* Performance Telemetry & Logs Tab */
+.perf-toolbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border);
+}
+.perf-kpi-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 10px; margin-bottom: 14px;
+}
+.perf-kpi {
+  background: var(--surface-subtle); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.perf-kpi-label { font-size: 11.5px; color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+.perf-kpi-val { font-size: 18px; font-weight: 700; margin-top: 3px; font-variant-numeric: tabular-nums; }
+.perf-kpi-sub { font-size: 11.5px; color: var(--text-muted); margin-top: 2px; }
+.perf-hints { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.perf-hint {
+  padding: 10px 12px; border-radius: var(--radius-sm); font-size: 13px;
+  border: 1px solid #bfdbfe; background: #eff6ff; color: #1e3a8a;
+}
+.perf-hint.warn {
+  border-color: #fed7aa; background: #fffbeb; color: #78350f;
+}
+.perf-section { margin-top: 16px; }
+.perf-section h3 {
+  margin: 0 0 8px; font-size: 13.5px; font-weight: 700; color: var(--text);
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.perf-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px; word-break: break-all;
+}
+.perf-history-row { cursor: pointer; }
+.perf-history-row:hover { background: var(--surface-subtle); }
+.perf-history-row.active { background: #eef2ff; font-weight: 600; }
+.perf-raw-details { margin-top: 16px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px; background: var(--surface-subtle); }
+.perf-raw-details summary { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--text-muted); user-select: none; }
+.perf-raw-pre {
+  margin: 10px 0 2px; max-height: 280px; overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px; line-height: 1.45; background: #0f172a; color: #e2e8f0;
+  padding: 10px 12px; border-radius: 6px; white-space: pre;
+}

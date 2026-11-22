@@ -40,6 +40,7 @@
         <input type="file" id="importFile" accept=".json,application/json" hidden>
       </label>
       <button type="button" id="btnDownload" class="btn btn-ghost btn-sm" hidden>Export JSON</button>
+      <button type="button" id="btnOpenPerf" class="btn btn-ghost btn-sm" title="Inspect action timings and export performance logs">Perf Logs</button>
     </div>
   </header>
 
@@ -255,6 +256,7 @@
             <button type="button" class="tab-btn" data-tab="curve">Coverage Curve</button>
             <button type="button" class="tab-btn" data-tab="overlap">Top Sellers</button>
             <button type="button" class="tab-btn" data-tab="coverage">Fetch Coverage</button>
+            <button type="button" class="tab-btn" data-tab="perf">Perf &amp; Logs <span class="tab-count" id="tabCountPerf">0</span></button>
           </div>
 
           <!-- Tab: Basket by Seller -->
@@ -412,6 +414,24 @@
             <div id="coverageMeta" class="coverage-meta"></div>
             <div id="coverageTables" class="table-scroll"></div>
           </div>
+
+          <!-- Tab: Perf & Logs -->
+          <div class="tab-panel" data-panel="perf">
+            <div class="perf-toolbar">
+              <div class="toolbar-group">
+                <label class="inline-label" for="perfRunSelect">Logged run</label>
+                <select id="perfRunSelect" class="select select-sm">
+                  <option value="">No logged runs yet</option>
+                </select>
+              </div>
+              <div class="toolbar-group">
+                <button type="button" id="btnCopyPerfMd" class="btn btn-primary btn-sm">Copy Markdown Report</button>
+                <button type="button" id="btnDownloadPerf" class="btn btn-secondary btn-sm">Download Perf JSON</button>
+                <button type="button" id="btnClearPerf" class="btn btn-ghost btn-sm">Clear history</button>
+              </div>
+            </div>
+            <div id="perfContent"></div>
+          </div>
         </section>
       </div>
     </main>
@@ -480,6 +500,7 @@
   <!-- Toast notifications -->
   <div id="toastHost" class="toast-host"></div>
 
+  <script src="telemetry.js"></script>
   <script src="collector.js"></script>
   <script src="wizard.js"></script>
   <script src="exports.js"></script>

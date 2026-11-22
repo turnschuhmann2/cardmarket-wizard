@@ -223,7 +223,119 @@
     return `${cleaned || 'cardmarket-list'}-${suffix}.txt`;
   }
 
+  // ---- Basket snapshots (exact basket after removals, saved in JSON exports and on cart add) ----
+  const SNAPSHOT_VERSION = 1;
+
+  const clone = value => (value == null ? value : JSON.parse(JSON.stringify(value)));
+
+  // tokenResult.bySeller is a Map, which JSON (and chrome.storage) would silently turn into {}.
+  function serializeTokenResult(tokenResult) {
+    if (!tokenResult) return null;
+    const bySeller = tokenResult.bySeller instanceof Map ? [...tokenResult.bySeller.entries()] : tokenResult.bySeller;
+    return clone({ ...tokenResult, bySeller });
+  }
+
+  function reviveTokenResult(raw) {
+    if (!raw || !Array.isArray(raw.assignments)) return null;
+    const bySeller = raw.bySeller instanceof Map
+      ? raw.bySeller
+      : Array.isArray(raw.bySeller)
+        ? new Map(raw.bySeller.filter(entry => Array.isArray(entry) && entry.length === 2))
+        : new Map(Object.entries(raw.bySeller || {}));
+    return { ...raw, bySeller };
+  }
+
+  // Magic card idProducts that Archidekt exports need Scryfall set codes for.
+  function snapshotPrintingIds(basket) {
+    const ids = new Set();
+    for (const parcel of basket?.parcels || []) {
+      for (const item of parcel.items || []) {
+        if (isArchidektEligible({ game: item.game, kind: item.kind || 'card' }) && item.idProduct) ids.add(item.idProduct);
+      }
+    }
+    return [...ids];
+  }
+
+  // `basket`, `tokenResult` and `removedItems` reproduce the live state (so removals stay undoable);
+  // `finalBasket` is the rendered result and the fallback when the live inputs no longer reproduce it.
+  function createBasketSnapshot({
+    basket, finalBasket, tokenResult = null, includeTokensInBasket = true, removedItems = [], tables = null,
+    leftOut = [], cuts = [], overlap = [], countsByScope = {}, buySellers = null, activeLimits = [], manualCuts = [],
+    shipTo = null, selectionSig = null, collectionFinishedAt = null, printings = {}, orderedAt = null, createdAt = Date.now(),
+  } = {}) {
+    if (!finalBasket?.parcels) throw new Error('No basket to snapshot.');
+    const parcelCount = finalBasket.parcels.length;
+    const n = Number(buySellers);
+    return {
+      version: SNAPSHOT_VERSION,
+      createdAt,
+      orderedAt,
+      selectionSig,
+      collectionFinishedAt,
+      shipTo,
+      buySellers: parcelCount ? Math.min(parcelCount, Math.max(1, Number.isFinite(n) && n > 0 ? Math.round(n) : parcelCount)) : 0,
+      includeTokensInBasket: !!includeTokensInBasket,
+      basket: clone(basket || finalBasket),
+      finalBasket: clone(finalBasket),
+      tokenResult: serializeTokenResult(tokenResult),
+      removedItems: clone(removedItems || []),
+      tables: clone(tables),
+      leftOut: clone(leftOut || []),
+      cuts: clone(cuts || []),
+      overlap: clone(overlap || []),
+      countsByScope: clone(countsByScope || {}),
+      activeLimits: clone(activeLimits || []),
+      manualCuts: clone(manualCuts || []),
+      printings: Object.fromEntries(
+        snapshotPrintingIds(finalBasket)
+          .filter(id => printings && printings[id])
+          .map(id => [id, { ...printings[id] }])
+      ),
+    };
+  }
+
+  const validBasket = b => !!b && Array.isArray(b.parcels) && b.parcels.every(p => p && typeof p.seller === 'string' && Array.isArray(p.items));
+
+  // Returns a normalized snapshot or null when the payload is missing / malformed / from a newer version.
+  function readBasketSnapshot(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    if (raw.version !== SNAPSHOT_VERSION) return null;
+    if (!validBasket(raw.finalBasket)) return null;
+    const basket = validBasket(raw.basket) ? raw.basket : raw.finalBasket;
+    const parcelCount = raw.finalBasket.parcels.length;
+    const n = Number(raw.buySellers);
+    return {
+      ...raw,
+      basket,
+      tokenResult: reviveTokenResult(raw.tokenResult),
+      removedItems: Array.isArray(raw.removedItems) ? raw.removedItems.filter(r => r && r.item && typeof r.seller === 'string') : [],
+      leftOut: Array.isArray(raw.leftOut) ? raw.leftOut : [],
+      cuts: Array.isArray(raw.cuts) ? raw.cuts : [],
+      overlap: Array.isArray(raw.overlap) ? raw.overlap : [],
+      countsByScope: raw.countsByScope && typeof raw.countsByScope === 'object' ? raw.countsByScope : {},
+      activeLimits: Array.isArray(raw.activeLimits) ? raw.activeLimits : [],
+      manualCuts: Array.isArray(raw.manualCuts) ? raw.manualCuts : [],
+      printings: raw.printings && typeof raw.printings === 'object' ? raw.printings : {},
+      buySellers: parcelCount ? Math.min(parcelCount, Math.max(1, Number.isFinite(n) && n > 0 ? Math.round(n) : parcelCount)) : 0,
+    };
+  }
+
+  // Cheap fingerprint to check a rebuilt basket matches the saved one exactly.
+  function basketFingerprint(basket) {
+    if (!basket?.parcels) return '';
+    const parcels = basket.parcels.map(p => `${p.seller}:${p.shippingCents ?? ''}:${(p.items || [])
+      .map(i => `${i.kind || 'card'}/${i.idArticle ?? ''}/${i.idProduct ?? ''}/${i.listId ?? ''}/${i.priceCents ?? ''}`)
+      .sort()
+      .join(',')}`);
+    return `${basket.totalCents ?? ''}|${parcels.join(';')}`;
+  }
+
   root.CardmarketExport = {
+    SNAPSHOT_VERSION,
+    createBasketSnapshot,
+    readBasketSnapshot,
+    basketFingerprint,
+    snapshotPrintingIds,
     collectBasketEntries,
     collectLeftOutEntries,
     groupExportEntries,

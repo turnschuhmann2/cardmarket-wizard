@@ -44,6 +44,9 @@
       this.detail = detail;
     }
   }
+  // Cardmarket rejected a cart POST because the CSRF/session token expired; callers should
+  // perform a paced refreshToken call and retry once rather than retrying unpaced inside cartRequest.
+  class TokenExpiredError extends Error {}
 
   function cents(text) {
     const match = /(\d[\d.]*),(\d{2})/.exec(text || '');
@@ -357,24 +360,35 @@
     const offers = [];
     let skipped = 0;
     for (const row of page.querySelectorAll('#UserOffersTable [id^="stockRow"]')) {
-      const attributes = tips(row, '.product-attributes');
-      const price = row.querySelector('.price-container .color-primary');
-      const quantity = row.querySelector('.amount-container .item-count') || row.querySelector('.item-count');
-      const condition = attributes.find(text => text in CONDITIONS);
-      const language = attributes.find(text => text in LANGUAGES);
-      if (!price || !quantity || (requireAttributes && (!condition || !language))) { skipped += 1; continue; }
-      offers.push({
-        idArticle: Number(row.id.replace('stockRow', '')),
-        seller,
-        idProduct: productOf(row),
-        condition: condition ? CONDITIONS[condition] : null,
-        language: language ? LANGUAGES[language] : null,
-        foil: attributes.includes('Foil'),
-        signed: attributes.includes('Signed'),
-        altered: attributes.includes('Altered'),
-        priceCents: cents(price.textContent),
-        quantity: parseInt(quantity.textContent, 10),
-      });
+      try {
+        const attributes = tips(row, '.product-attributes');
+        const price = row.querySelector('.price-container .color-primary');
+        const quantity = row.querySelector('.amount-container .item-count') || row.querySelector('.item-count');
+        const condition = attributes.find(text => text in CONDITIONS);
+        const language = attributes.find(text => text in LANGUAGES);
+        if (!price || !quantity || (requireAttributes && (!condition || !language))) { skipped += 1; continue; }
+        const idArticle = Number(row.id.replace('stockRow', ''));
+        const priceCents = cents(price.textContent);
+        const qty = parseInt(quantity.textContent, 10);
+        if (!Number.isFinite(idArticle) || idArticle <= 0 || !Number.isFinite(qty) || qty <= 0) {
+          skipped += 1;
+          continue;
+        }
+        offers.push({
+          idArticle,
+          seller,
+          idProduct: productOf(row),
+          condition: condition ? CONDITIONS[condition] : null,
+          language: language ? LANGUAGES[language] : null,
+          foil: attributes.includes('Foil'),
+          signed: attributes.includes('Signed'),
+          altered: attributes.includes('Altered'),
+          priceCents,
+          quantity: qty,
+        });
+      } catch {
+        skipped += 1;
+      }
     }
     const total = parseInt((page.querySelector('.total-count')?.textContent || '').replace(/\D/g, ''), 10);
     const hasNext = [...page.querySelectorAll('a[href*="site="]')]
@@ -389,6 +403,22 @@
     const originRef = baseOrigin || (typeof location !== 'undefined' ? location.href : 'https://www.cardmarket.com');
     let cachedToken = null;
 
+    function inferUrlBucket(targetUrl, method) {
+      if (root.CardmarketTelemetry?.classifyUrlBucket) {
+        return root.CardmarketTelemetry.classifyUrlBucket(targetUrl, method);
+      }
+      let path = String(targetUrl || '');
+      try { path = new URL(path, originRef).pathname; } catch {}
+      if (/\/AjaxAction\/ShoppingCart_/i.test(path)) return 'cart';
+      if (/\/AjaxAction\/Product_LoadMore/i.test(path)) return 'products';
+      if (/\/ShoppingCart(?:\/|$)/i.test(path)) return 'cart-read';
+      if (/\/Wants(?:\/|$)/i.test(path)) return 'wants';
+      if (/\/Cards\//i.test(path)) return 'cards';
+      if (/\/Users\/[^/]+\/Offers/i.test(path)) return 'users';
+      if (/\/Products(?:\/|$)/i.test(path)) return 'products';
+      return String(method || 'GET').toUpperCase() === 'POST' ? 'cart' : 'other';
+    }
+
     async function request(url, init) {
       const started = Date.now();
       let response, text;
@@ -399,9 +429,20 @@
         if (init?.method && init.method !== 'GET' || !(error instanceof TypeError)) throw error;
         throw new RetryableError('Network error while reading Cardmarket', { cause: error });
       }
+      const totalMs = Date.now() - started;
+      const method = init?.method || 'GET';
+      const t = response?._timing || null;
+      const extraTiming = t ? {
+        ...(Number.isFinite(t.fetchMs) ? { fetchMs: t.fetchMs, bridgeOverheadMs: Math.max(0, totalMs - t.fetchMs) } : {}),
+        ...(Number.isFinite(t.headersMs) ? { headersMs: t.headersMs } : {}),
+        ...(Number.isFinite(t.bodyMs) ? { bodyMs: t.bodyMs } : {}),
+        ...(Number.isFinite(t.tabResolveMs) ? { tabResolveMs: t.tabResolveMs } : {}),
+        ...(typeof t.tabCacheHit === 'boolean' ? { tabCacheHit: t.tabCacheHit } : {}),
+      } : {};
       const title = (/<title>([^<]{0,120})/i.exec(text.slice(0, 3000))?.[1] || '').trim();
       onResponse({
-        method: init?.method || 'GET', url, status: response.status, ms: Date.now() - started, bytes: text.length,
+        method, bucket: inferUrlBucket(url, method), url, status: response.status, ms: totalMs, bytes: text.length,
+        ...extraTiming,
         redirectedTo: response.redirected ? new URL(response.url, originRef).pathname : null,
         cfMitigated: response.headers.get('cf-mitigated'), retryAfter: response.headers.get('retry-after'), title: title || null,
         snippet: response.ok ? null : text.replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300),
@@ -464,8 +505,8 @@
       return fetchFreshToken(gameOverride);
     }
 
-    async function cartRequest(action, items, gameOverride, retriedToken = false) {
-      const token = await resolveToken(gameOverride, { forceFresh: retriedToken });
+    async function cartRequest(action, items, gameOverride) {
+      const token = await resolveToken(gameOverride);
       const body = new FormData();
       body.append('__cmtkn', token);
       for (const { idArticle, amount } of items) {
@@ -480,8 +521,9 @@
       const said = safeDecodeBase64(value('resultsMessage')) || text;
       const clean = said.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
       if (code !== null) {
-        if (!retriedToken && /token|csrf|__cmtkn|session/i.test(`${code} ${clean}`)) {
-          return cartRequest(action, items, gameOverride, true);
+        if (/token|csrf|__cmtkn|session/i.test(`${code} ${clean}`)) {
+          cachedToken = null;
+          throw new TokenExpiredError(`Cardmarket rejected session token (${code}): ${clean}`);
         }
         throw new CartRejectError(`Cardmarket answered ${code}: ${clean}`, { code, detail: clean });
       }
@@ -600,7 +642,18 @@
       // per-seller shipping from each row.
       async productPage(entry, query) {
         const qs = queryString(query, false);
-        const target = entry.productPath || entry.url;
+        const rawTarget = entry.productPath || entry.url;
+        const localeRe = /^\/[a-z]{2}(?:-[a-z]{2})?\/(?=(?:Magic|YuGiOh|Pokemon|OnePiece|Lorcana)\/)/i;
+        let target = rawTarget;
+        if (typeof rawTarget === 'string' && rawTarget) {
+          if (/^https?:\/\//i.test(rawTarget)) {
+            const u = new URL(rawTarget);
+            u.pathname = u.pathname.replace(localeRe, '/en/');
+            target = u.toString();
+          } else {
+            target = rawTarget.replace(localeRe, '/en/');
+          }
+        }
         const { text: html, url } = await request(`${resolveUrl(target)}${qs ? `?${qs}` : ''}`);
         const page = new DOMParser().parseFromString(html, 'text/html');
         const table = page.querySelector('#table');
@@ -629,7 +682,7 @@
         if (pageNumber > 1) params.set('site', pageNumber);
         const { text: html } = await request(`${baseFor(gameOverride)}/Users/${encodeURIComponent(seller)}/Offers/Singles?${params}`);
         const page = new DOMParser().parseFromString(html, 'text/html');
-        return parseUserOffersPage(page, seller, pageNumber, originRef, { requireAttributes: true, allowEmpty: false });
+        return parseUserOffersPage(page, seller, pageNumber, originRef, { requireAttributes: true, allowEmpty: true });
       },
 
       // A seller's cheap Magic token offers (idRarity=24, sorted cheapest-first, 20 per page).
@@ -761,21 +814,32 @@
         return changed;
       },
       async wait(bucket) {
-        for (let until = holds.get(bucket) || 0; until > Date.now(); until = holds.get(bucket) || 0) {
-          await sleepUntil(until, signal);
+        let holdMs = 0;
+        let paceWaitMs = 0;
+        for (;;) {
+          for (let until = holds.get(bucket) || 0; until > Date.now(); until = holds.get(bucket) || 0) {
+            const h0 = Date.now();
+            await sleepUntil(until, signal);
+            holdMs += Date.now() - h0;
+          }
+          const now = Date.now();
+          const at = Math.max(now, nextAt, bucketNext.get(bucket) || 0);
+          const useJitter = Boolean(jitter) && this.intervalMs > 0;
+          const globalGap = useJitter ? Math.round(this.intervalMs * (0.85 + Math.random() * 0.3)) : this.intervalMs;
+          nextAt = at + globalGap;
+          const bGapBase = Math.max(bucketFloors.get(bucket) || 0, bucketExtra.get(bucket) || 0);
+          if (bGapBase > 0) {
+            // Never jitter below a bucket floor (e.g. cart >= 2000ms, products >= 3000ms).
+            const bGap = useJitter ? Math.round(bGapBase * (1 + Math.random() * 0.15)) : bGapBase;
+            bucketNext.set(bucket, at + bGap);
+          }
+          if (at > now) {
+            const w0 = Date.now();
+            await sleepUntil(at, signal);
+            paceWaitMs += Date.now() - w0;
+          }
+          if ((holds.get(bucket) || 0) <= Date.now()) return { paceWaitMs, holdMs };
         }
-        const now = Date.now();
-        const at = Math.max(now, nextAt, bucketNext.get(bucket) || 0);
-        const useJitter = Boolean(jitter) && this.intervalMs > 0;
-        const globalGap = useJitter ? Math.round(this.intervalMs * (0.85 + Math.random() * 0.3)) : this.intervalMs;
-        nextAt = at + globalGap;
-        const bGapBase = Math.max(bucketFloors.get(bucket) || 0, bucketExtra.get(bucket) || 0);
-        if (bGapBase > 0) {
-          // Never jitter below a bucket floor (e.g. cart >= 2000ms, products >= 3000ms).
-          const bGap = useJitter ? Math.round(bGapBase * (1 + Math.random() * 0.15)) : bGapBase;
-          bucketNext.set(bucket, at + bGap);
-        }
-        if (at > now) await sleepUntil(at, signal);
       },
     };
   }
@@ -797,20 +861,49 @@
     const defaultBuckets = intervalMs >= 100 ? { cart: 2000, products: 3000 } : { cart: 2000 };
     const resolvedBuckets = bucketIntervals !== undefined ? bucketIntervals : defaultBuckets;
     const run = limiter(concurrency);
-    const pace = pacer(intervalMs, resolvedBuckets, signal, { jitter });
-    const stats = { requests: 0, retries: 0, waits: 0, pauses: 0, cachedQueries: 0, startedAt: Date.now(), finishedAt: null };
+    const internalAbort = new AbortController();
+    const onExternalAbort = () => internalAbort.abort();
+    if (signal) {
+      if (signal.aborted) internalAbort.abort();
+      else signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+    const paceSignal = internalAbort.signal;
+    const pace = pacer(intervalMs, resolvedBuckets, paceSignal, { jitter });
+    const stats = {
+      requests: 0, retries: 0, waits: 0, pauses: 0, cachedQueries: 0, startedAt: Date.now(), finishedAt: null,
+      timings: { paceWaitMs: 0, holdMs: 0, execMs: 0, slowdowns: 0, recoveries: 0, initialIntervalMs: intervalMs, byBucket: {} },
+    };
+    function recordTiming(bucket, method, { paceWaitMs = 0, holdMs = 0, execMs = 0, ok = true, retries = 0 }) {
+      const t = stats.timings;
+      t.paceWaitMs += paceWaitMs;
+      t.holdMs += holdMs;
+      t.execMs += execMs;
+      const b = t.byBucket[bucket] || (t.byBucket[bucket] = { calls: 0, paceWaitMs: 0, holdMs: 0, execMs: 0, retries: 0 });
+      b.calls += 1;
+      b.paceWaitMs += paceWaitMs;
+      b.holdMs += holdMs;
+      b.execMs += execMs;
+      b.retries += retries;
+      log({ type: 'runner-call', bucket, method, paceWaitMs, holdMs, execMs, ok, retries });
+    }
     const cleanStreak = new Map();
     let blocked = null;
     let pause = null;
     let refusals = 0;
     let pausesWithoutSuccess = 0;
 
+    function setBlocked(err) {
+      if (!blocked) blocked = err;
+      if (!internalAbort.signal.aborted) internalAbort.abort();
+      return blocked;
+    }
+
     // One shared prompt however many concurrent slots hit a check at the same time.
     function promptUser(message, attempt) {
       if (!pause) {
         pause = waitForUser(message, attempt).then(
           () => { log({ type: 'resume' }); },
-          () => { blocked = blocked || new StoppedError('Stopped.'); },
+          () => { setBlocked(new StoppedError('Stopped.')); },
         ).finally(() => { pause = null; });
       }
       return pause;
@@ -822,18 +915,28 @@
         try {
           for (;;) {
             if (pause) await pause;
-            if (signal?.aborted) throw new StoppedError('Stopped.');
+            if (signal?.aborted) throw setBlocked(new StoppedError('Stopped.'));
             if (blocked) throw blocked;
-            await pace.wait(bucket);
-            if (signal?.aborted) throw new StoppedError('Stopped.');
+            const waitTiming = await pace.wait(bucket);
+            if (blocked) throw blocked;
+            if (signal?.aborted) throw setBlocked(new StoppedError('Stopped.'));
             stats.requests += 1;
+            const execStart = Date.now();
             try {
               const res = await site[method](...args);
+              recordTiming(bucket, method, {
+                paceWaitMs: waitTiming?.paceWaitMs || 0,
+                holdMs: waitTiming?.holdMs || 0,
+                execMs: Date.now() - execStart,
+                ok: true,
+                retries,
+              });
               if (adaptiveBackoff && recoverEvery > 0) {
                 const nextStreak = (cleanStreak.get(bucket) || 0) + 1;
                 if (nextStreak >= recoverEvery) {
                   cleanStreak.set(bucket, 0);
                   if (pace.recover(bucket)) {
+                    stats.timings.recoveries += 1;
                     log({ type: 'pace-recover', bucket, intervalMs: pace.intervalMs, bucketIntervalMs: pace.effectiveInterval(bucket) });
                   }
                 } else {
@@ -842,6 +945,13 @@
               }
               return res;
             } catch (error) {
+              recordTiming(bucket, method, {
+                paceWaitMs: waitTiming?.paceWaitMs || 0,
+                holdMs: waitTiming?.holdMs || 0,
+                execMs: Date.now() - execStart,
+                ok: false,
+                retries,
+              });
               const check = error instanceof BlockedError && !(error instanceof StoppedError) && !error.login;
               if (!(error instanceof RetryableError) && !(error instanceof RefusedError) && !check) throw error;
               const now = Date.now();
@@ -852,34 +962,38 @@
                 cleanStreak.set(bucket, 0);
                 if (adaptiveBackoff && newWave && (pace.intervalMs > 0 || pace.bucketFloors.has(bucket))) {
                   pace.slowDown(bucket);
+                  stats.timings.slowdowns += 1;
                   log({ type: 'pace-slowdown', bucket, intervalMs: pace.intervalMs, bucketIntervalMs: pace.effectiveInterval(bucket) });
                 }
               }
               const delay = readRetryDelays[retries];
               const until = now + Math.max(delay ?? 0, error.readRetryAfterMs ?? error.retryAfterMs ?? 0);
-              pace.holds.set(bucket, Math.max(pace.holds.get(bucket) || 0, until));
               if (until > firstFailure + readRetryBudgetMs) {
                 const retryAfterMs = error.readRetryAfterMs ?? error.retryAfterMs ?? 0;
+                const err = setBlocked(new BlockedError(`Cardmarket asked to wait until ${new Date(until).toLocaleTimeString()}. Collection paused; resume later.`));
                 if (retryAfterMs > 0) await onDeferred({ until });
-                throw new BlockedError(`Cardmarket asked to wait until ${new Date(until).toLocaleTimeString()}. Collection paused; resume later.`);
+                throw err;
               }
               if (delay === undefined) {
-                if (prompted || !waitForUser) throw new BlockedError(`${error.message} after ${retries} retries.`);
+                if (prompted || !waitForUser) throw setBlocked(new BlockedError(`${error.message} after ${retries} retries.`));
+                pace.holds.set(bucket, Math.max(pace.holds.get(bucket) || 0, until));
                 prompted = true;
                 stats.pauses += 1;
-                await sleepUntil(until, signal);
+                await sleepUntil(until, paceSignal);
                 await promptUser(`${error.message} after ${retries} retries.`, -1);
               } else {
+                pace.holds.set(bucket, Math.max(pace.holds.get(bucket) || 0, until));
                 retries += 1;
                 stats.retries += 1;
                 log({ type: 'retry', method, kind: check ? 'check' : error instanceof RefusedError ? 'refused' : 'rate', error: error.message, attempt: retries, until, intervalMs: pace.intervalMs });
                 onWait({ bucket, until, retry: retries, intervalMs: pace.intervalMs });
-                await sleepUntil(until, signal);
+                await sleepUntil(until, paceSignal);
               }
             }
           }
         } catch (error) {
-          if (error instanceof BlockedError || signal?.aborted) blocked = signal?.aborted ? new StoppedError('Stopped.') : error;
+          if (signal?.aborted) setBlocked(new StoppedError('Stopped.'));
+          else if (error instanceof BlockedError) setBlocked(error);
           throw blocked || error;
         }
       });
@@ -893,26 +1007,47 @@
         try {
           return await run(async () => {
             if (pause) await pause;
-            await pace.wait(bucket);
-            if (!blocked && signal?.aborted) blocked = new StoppedError('Stopped.');
             if (blocked) throw blocked;
+            if (signal?.aborted) throw setBlocked(new StoppedError('Stopped.'));
+            const waitTiming = await pace.wait(bucket);
+            if (blocked) throw blocked;
+            if (signal?.aborted) throw setBlocked(new StoppedError('Stopped.'));
             stats.requests += 1;
-            const result = await site[method](...args);
-            refusals = 0;
-            pausesWithoutSuccess = 0;
-            return result;
+            const execStart = Date.now();
+            try {
+              const result = await site[method](...args);
+              recordTiming(bucket, method, {
+                paceWaitMs: waitTiming?.paceWaitMs || 0,
+                holdMs: waitTiming?.holdMs || 0,
+                execMs: Date.now() - execStart,
+                ok: true,
+                retries: attempt,
+              });
+              refusals = 0;
+              pausesWithoutSuccess = 0;
+              return result;
+            } catch (execErr) {
+              recordTiming(bucket, method, {
+                paceWaitMs: waitTiming?.paceWaitMs || 0,
+                holdMs: waitTiming?.holdMs || 0,
+                execMs: Date.now() - execStart,
+                ok: false,
+                retries: attempt,
+              });
+              throw execErr;
+            }
           });
         } catch (error) {
+          if (blocked) throw blocked;
           if (error instanceof RefusedError) {
             refusals += 1;
             log({ type: 'refused', method, error: error.message, inARow: refusals });
-            if (refusals >= 3 && !blocked) blocked = new StoppedError(`${error.message} Stopped after ${refusals} refusals in a row; try again later.`);
+            if (refusals >= 3) setBlocked(new StoppedError(`${error.message} Stopped after ${refusals} refusals in a row; try again later.`));
             throw error;
           }
           if (error instanceof BlockedError && !(error instanceof StoppedError) && !error.login && waitForUser && !blocked) {
             if (!pause && pausesWithoutSuccess >= maxPausesWithoutSuccess) {
-              blocked = new StoppedError(`Cardmarket still refused after ${pausesWithoutSuccess} waits in a row. Stopped; try again later.`);
-              throw blocked;
+              throw setBlocked(new StoppedError(`Cardmarket still refused after ${pausesWithoutSuccess} waits in a row. Stopped; try again later.`));
             }
             if (!pause) {
               pausesWithoutSuccess += 1;
@@ -925,7 +1060,9 @@
             attempt -= 1;
             continue;
           }
-          if (error instanceof BlockedError) { blocked = blocked || error; throw error; }
+          if (error instanceof BlockedError) {
+            throw setBlocked(signal?.aborted ? new StoppedError('Stopped.') : error);
+          }
           if (!(error instanceof RetryableError)) throw error;
           // A 5xx on a cart POST may already have added the items; only rate limits are safe to retry.
           if (bucket === 'cart' && error.cause !== 'rate') throw error;
@@ -933,8 +1070,7 @@
             if (maxWaitMs != null && error.retryAfterMs > maxWaitMs) {
               const until = Date.now() + error.retryAfterMs;
               const mins = Math.max(1, Math.ceil(error.retryAfterMs / 60000));
-              blocked = new BlockedError(`Cardmarket rate-limited this action until ${new Date(until).toLocaleTimeString()} (~${mins} min). Try again later.`);
-              throw blocked;
+              throw setBlocked(new BlockedError(`Cardmarket rate-limited this action until ${new Date(until).toLocaleTimeString()} (~${mins} min). Try again later.`));
             }
             waits += 1;
             stats.waits += 1;
@@ -951,7 +1087,7 @@
           stats.retries += 1;
           if (error.cause === 'rate') pace.intervalMs = Math.min(pace.intervalMs * 2, 10000);
           log({ type: 'retry', method, error: error.message, attempt, intervalMs: pace.intervalMs });
-          await sleepUntil(Date.now() + retryDelayMs * 2 ** attempt, signal);
+          await sleepUntil(Date.now() + retryDelayMs * 2 ** attempt, paceSignal);
         }
       }
     }
@@ -959,7 +1095,11 @@
     return {
       call, stats, pace,
       blocked: () => blocked,
-      finish() { stats.finishedAt = Date.now(); stats.intervalMs = pace.intervalMs; },
+      finish() {
+        if (signal) signal.removeEventListener('abort', onExternalAbort);
+        stats.finishedAt = Date.now();
+        stats.intervalMs = pace.intervalMs;
+      },
     };
   }
 
@@ -990,8 +1130,22 @@
           stats.cachedQueries += 1;
           page = hit.value;
         } else {
-          page = await call('productPage', entry, query);
-          cache?.set(pKey, { at: Date.now(), value: page });
+          try {
+            page = await call('productPage', entry, query);
+            cache?.set(pKey, { at: Date.now(), value: page });
+          } catch (error) {
+            if (error instanceof BlockedError) throw error;
+            log({ type: 'product-error', product: entry.name, error: error.message });
+            return {
+              key: entry.key, name: entry.name, amount: entry.amount,
+              kind: 'product', game: entry.game || 'Magic',
+              category: entry.category || 'Product', productPath: entry.productPath || entry.url || null,
+              listId: entry.listId ?? null, listName: entry.listName ?? null,
+              targetCents: null, cutoffCents: null,
+              verdict: 'incomplete', error: error.message,
+              printings: 1, requests: 1, queries: [], offers: [],
+            };
+          }
         }
         const sorted = [...page.offers].sort((a, b) => (a.priceCents + (a.shippingCents || 0)) - (b.priceCents + (b.shippingCents || 0)));
         const target = targetPrice(sorted, entry.amount, targetCopies, targetSellers) ?? sorted[0]?.priceCents ?? null;
@@ -1009,7 +1163,7 @@
       const offers = new Map();
       const queries = [];
       for (const printing of entry.printings) {
-        for (const language of entry.languages) {
+        for (const language of queryLanguagesFor(entry)) {
           queries.push({
             game: entry.game || 'Magic', idProduct: printing.idProduct, guideLowCents: printing.guideLowCents ?? null, language,
             sellerCountries, minCondition: entry.minCondition, foil: entry.foil, signed: entry.signed,
@@ -1208,13 +1362,20 @@
     return null;
   }
 
+  const ALL_LANGUAGE_IDS = Object.values(LANGUAGES);
+  function queryLanguagesFor(entry) {
+    const langs = [...new Set((entry.languages || []).filter(Boolean))];
+    if (!langs.length || ALL_LANGUAGE_IDS.every(id => langs.includes(id))) return [null];
+    return langs;
+  }
+
   function matchesWant(entry, offer) {
     if (entry.maxPriceCents != null && offer.priceCents > entry.maxPriceCents) return false;
     if (entry.kind === 'product') {
       return (!entry.languages?.length || offer.language === null || entry.languages.includes(offer.language)) &&
         (entry.minCondition == null || offer.condition <= entry.minCondition);
     }
-    return entry.languages.includes(offer.language) && offer.condition <= entry.minCondition &&
+    return (!entry.languages?.length || entry.languages.includes(offer.language)) && offer.condition <= entry.minCondition &&
       (entry.foil === 'any' || offer.foil === (entry.foil === 'Y')) &&
       (entry.signed === 'any' || offer.signed === (entry.signed === 'Y')) &&
       (entry.altered === 'any' || offer.altered === (entry.altered === 'Y'));
@@ -1337,6 +1498,10 @@
     let done = 0;
     const cardSlot = limiter(slotSize);
     const countriesKey = [...sellerCountries].map(Number).sort((a, b) => a - b).join('.');
+    const phase1Start = Date.now();
+    const phase1StartReqs = stats.requests;
+    const phase1StartCached = stats.cachedQueries;
+    log({ type: 'phase-start', phase: 'cards', items: entries.length });
     await Promise.all(entries.map(entry => cardSlot(async () => {
       const state = cardState.get(entry.key);
       if (entry.kind === 'product') {
@@ -1403,7 +1568,8 @@
       try {
         const groups = expansionGroups(entry.printings, expansionGroupSize);
         state.groups = groups.length;
-        for (const language of entry.languages) {
+        for (const language of queryLanguagesFor(entry)) {
+          const langKey = language ?? 'any';
           for (const [index, group] of groups.entries()) {
             if (index > 0 && group.minGuideCents > cutoffOf(entry) * groupSkipFactor) {
               state.groupsSkipped += groups.length - index;
@@ -1414,7 +1580,7 @@
                 language, sellerCountries, minCondition: entry.minCondition, foil: entry.foil, signed: entry.signed, altered: entry.altered,
                 expansions: group.expansions, sellerType,
               };
-              const key = ['card', entry.cardPath, language, countriesKey, entry.minCondition, entry.foil, entry.signed, entry.altered,
+              const key = ['card', entry.cardPath, langKey, countriesKey, entry.minCondition, entry.foil, entry.signed, entry.altered,
                 (group.expansions || []).join('.'), sellerType ?? ''].join('|');
               const page = await cached(key, () => call('cardPage', entry, query));
               let kept = 0;
@@ -1429,7 +1595,7 @@
               // Keep multi-country Phase 1 a superset of domestic sellers on crowded cards (and reuse
               // any fresh domestic query cache at zero network cost).
               if (seedDomestic && !runner.blocked()) {
-                const domKey = ['card', entry.cardPath, language, domesticKeyPart, entry.minCondition, entry.foil, entry.signed, entry.altered,
+                const domKey = ['card', entry.cardPath, langKey, domesticKeyPart, entry.minCondition, entry.foil, entry.signed, entry.altered,
                   (group.expansions || []).join('.'), sellerType ?? ''].join('|');
                 const rawRows = page.offers.length + (page.skipped || 0);
                 const domCount = domesticLocation ? page.offers.filter(o => o.location === domesticLocation).length : 0;
@@ -1466,17 +1632,26 @@
       }
     })));
 
+    log({
+      type: 'phase-end', phase: 'cards', ms: Date.now() - phase1Start, items: entries.length,
+      requests: stats.requests - phase1StartReqs, cachedQueries: stats.cachedQueries - phase1StartCached,
+    });
+
     const observedLocations = [...new Set(sellerLocations.values())];
     const isMultiCountry = observedLocations.length > 1 ||
       Boolean(domesticLocation && observedLocations.some(loc => loc !== domesticLocation));
 
     let resolvedTables = shippingTables;
     if (isMultiCountry && !resolvedTables && typeof loadShippingTables === 'function') {
+      const shipStart = Date.now();
+      log({ type: 'phase-start', phase: 'shipping-tables', locations: observedLocations.length });
       try {
         resolvedTables = await loadShippingTables(observedLocations);
       } catch (error) {
         log({ type: 'shipping-tables-error', error: error.message });
         resolvedTables = null;
+      } finally {
+        log({ type: 'phase-end', phase: 'shipping-tables', ms: Date.now() - shipStart, locations: observedLocations.length });
       }
     }
 
@@ -1627,18 +1802,22 @@
 
     const sellers = [];
     async function askSeller(row) {
+      const sellerStart = Date.now();
       const loc = sellerLocations.get(row.seller) || null;
-      const state = { ...row, location: loc, pages: 0, rows: 0, total: null, matched: 0, ceilingStopped: false, status: 'pending', error: null };
+      const state = { ...row, location: loc, pages: 0, rows: 0, total: null, matched: 0, ceilingStopped: false, crossGameSkips: 0, ms: 0, status: 'pending', error: null };
       sellers.push(state);
       try {
         let totalSum = 0;
         let hasTotal = false;
         let allComplete = true;
+        const listErrors = [];
         for (const list of activeLists) {
+          if (runner.blocked()) break;
           const listGame = list.game || 'Magic';
           // In multi-game runs, skip querying a seller for a game where they had zero Phase-1
           // appearances across >= 5 wanted cards of that game.
           if (activeLists.length > 1 && (cardEntriesPerGame.get(listGame) || 0) >= 5 && !sellerGames.get(row.seller)?.has(listGame)) {
+            state.crossGameSkips += 1;
             continue;
           }
           const listEntries = entries.filter(e =>
@@ -1687,63 +1866,79 @@
           let prevPageLastPrice = -Infinity;
           let stoppedByCeiling = false;
 
-          for (let pageNumber = 1; pageNumber <= maxSellerPages; pageNumber += 1) {
-            const cacheId = activeLists.length === 1 && listGame === 'Magic'
-              ? ['seller2', row.seller, list.listId, pageNumber].join('|')
-              : ['seller2', listGame, row.seller, list.listId, pageNumber].join('|');
-            const page = await cached(cacheId, () =>
-              activeLists.length === 1 && !lists
-                ? call('sellerWants', row.seller, list.listId, pageNumber)
-                : call('sellerWants', row.seller, list.listId, pageNumber, listGame));
-            state.pages += 1;
-            state.rows += page.offers.length;
-            listRows += page.offers.length;
-            if (page.total !== null) listTotal = page.total;
+          try {
+            for (let pageNumber = 1; pageNumber <= maxSellerPages; pageNumber += 1) {
+              const cacheId = activeLists.length === 1 && listGame === 'Magic'
+                ? ['seller2', row.seller, list.listId, pageNumber].join('|')
+                : ['seller2', listGame, row.seller, list.listId, pageNumber].join('|');
+              const page = await cached(cacheId, () =>
+                activeLists.length === 1 && !lists
+                  ? call('sellerWants', row.seller, list.listId, pageNumber)
+                  : call('sellerWants', row.seller, list.listId, pageNumber, listGame));
+              state.pages += 1;
+              state.rows += page.offers.length;
+              listRows += page.offers.length;
+              if (page.total !== null) listTotal = page.total;
 
-            // Verify ascending price order before trusting price-based early stopping.
-            if (stillAscending && page.offers.length) {
-              if (page.offers[0].priceCents < prevPageLastPrice) stillAscending = false;
-              for (let i = 1; stillAscending && i < page.offers.length; i += 1) {
-                if (page.offers[i].priceCents < page.offers[i - 1].priceCents) stillAscending = false;
+              // Verify ascending price order before trusting price-based early stopping.
+              if (stillAscending && page.offers.length) {
+                if (page.offers[0].priceCents < prevPageLastPrice) stillAscending = false;
+                for (let i = 1; stillAscending && i < page.offers.length; i += 1) {
+                  if (page.offers[i].priceCents < page.offers[i - 1].priceCents) stillAscending = false;
+                }
+                prevPageLastPrice = page.offers[page.offers.length - 1].priceCents;
               }
-              prevPageLastPrice = page.offers[page.offers.length - 1].priceCents;
-            }
 
-            for (const offer of page.offers) {
-              const enriched = loc && !offer.location ? { ...offer, seller: row.seller, location: loc } : { ...offer, seller: row.seller };
-              const targetsForProduct = byProduct.get(`${listGame}:${offer.idProduct}`) || [];
-              for (const entry of targetsForProduct) {
-                if (entry.listId != null && String(entry.listId) !== String(list.listId)) continue;
-                if (keep(entry, enriched)) {
-                  state.matched += 1;
-                  sellerEntryOffers.get(entry.key)?.set(enriched.idArticle, enriched);
+              for (const offer of page.offers) {
+                const enriched = loc && !offer.location ? { ...offer, seller: row.seller, location: loc } : { ...offer, seller: row.seller };
+                const targetsForProduct = byProduct.get(`${listGame}:${offer.idProduct}`) || [];
+                for (const entry of targetsForProduct) {
+                  if (entry.listId != null && String(entry.listId) !== String(list.listId)) continue;
+                  if (keep(entry, enriched)) {
+                    state.matched += 1;
+                    sellerEntryOffers.get(entry.key)?.set(enriched.idArticle, enriched);
+                  }
                 }
               }
+              if (!page.hasNext) break;
+              if (stillAscending && page.offers.length > 0 && prevPageLastPrice > remainingCeiling()) {
+                stoppedByCeiling = true;
+                state.ceilingStopped = true;
+                break;
+              }
             }
-            if (!page.hasNext) break;
-            if (stillAscending && page.offers.length > 0 && prevPageLastPrice > remainingCeiling()) {
-              stoppedByCeiling = true;
-              state.ceilingStopped = true;
-              break;
+            if (listTotal !== null) {
+              totalSum += listTotal;
+              hasTotal = true;
+              if (!stoppedByCeiling && listRows < listTotal) allComplete = false;
             }
-          }
-          if (listTotal !== null) {
-            totalSum += listTotal;
-            hasTotal = true;
-            if (!stoppedByCeiling && listRows < listTotal) allComplete = false;
+          } catch (listErr) {
+            if (listErr instanceof BlockedError) throw listErr;
+            allComplete = false;
+            listErrors.push(listErr.message);
           }
         }
         state.total = hasTotal ? totalSum : null;
-        state.status = allComplete ? 'complete' : 'partial';
+        if (listErrors.length) state.error = listErrors.join('; ');
+        state.status = runner.blocked()
+          ? 'blocked'
+          : (listErrors.length && state.pages === 0)
+            ? 'error'
+            : allComplete ? 'complete' : 'partial';
       } catch (error) {
         state.status = error instanceof BlockedError ? 'blocked' : 'error';
         state.error = error.message;
       }
+      state.ms = Date.now() - sellerStart;
       log({ type: 'seller', ...state });
       progress('sellers', sellers.length, Math.min(chosen.length, sellerLimit));
     }
 
     if (activeLists.length) {
+      const phase2Start = Date.now();
+      const phase2StartReqs = stats.requests;
+      const phase2StartCached = stats.cachedQueries;
+      log({ type: 'phase-start', phase: 'sellers', sellers: Math.min(chosen.length, sellerLimit) });
       const sellerSlot = limiter(slotSize);
       let next = 0;
       let lastCents = null;
@@ -1752,16 +1947,30 @@
         const size = next === 0 ? minSellers : sellerBatch;
         const batch = chosen.slice(next, Math.min(next + size, sellerLimit));
         next += batch.length;
+        const batchStart = Date.now();
+        const batchSellerStart = sellers.length;
         await Promise.all(batch.map(row => sellerSlot(() => askSeller(row))));
-        if (!evaluate) break;
+        const sellersMs = Date.now() - batchStart;
+        const batchSlice = sellers.slice(batchSellerStart);
+        const batchPages = batchSlice.reduce((s, r) => s + (r.pages || 0), 0);
+        const batchCeilingStops = batchSlice.filter(r => r.ceilingStopped).length;
+        if (runner.blocked() || !evaluate) break;
+        const evalStart = Date.now();
         const centsVal = await evaluate(buildResults());
+        const evalMs = Date.now() - evalStart;
+        const batchMs = Date.now() - batchStart;
         const saved = lastCents === null ? null : lastCents - centsVal;
-        batches.push({ asked: next, basketCents: centsVal, savedCents: saved });
-        log({ type: 'seller-batch', asked: next, basketCents: centsVal, savedCents: saved });
-        if (saved !== null && saved < improvementCents) break;
+        const batchInfo = { asked: next, basketCents: centsVal, savedCents: saved, sellersMs, evalMs, batchMs, pages: batchPages, ceilingStops: batchCeilingStops };
+        batches.push(batchInfo);
+        log({ type: 'seller-batch', ...batchInfo });
+        if (saved !== null && !(saved >= improvementCents)) break;
         lastCents = centsVal;
       }
       stats.sellerBatches = batches;
+      log({
+        type: 'phase-end', phase: 'sellers', ms: Date.now() - phase2Start, sellers: sellers.length,
+        requests: stats.requests - phase2StartReqs, cachedQueries: stats.cachedQueries - phase2StartCached,
+      });
     }
 
     runner.finish();
@@ -1803,7 +2012,8 @@
     let done = 0;
 
     async function fetchOneSeller(seller) {
-      const summary = { seller, mode: 'full', pages: 0, offers: 0, total: null, fromCache: false, status: 'ok', error: null };
+      const sellerStart = Date.now();
+      const summary = { seller, mode: 'full', pages: 0, offers: 0, total: null, fromCache: false, ms: 0, status: 'ok', error: null };
       const byArticle = new Map();
       const addOffers = list => {
         for (const offer of list || []) {
@@ -1819,6 +2029,7 @@
         summary.fromCache = true;
         summary.total = fullHit.value.total ?? byArticle.size;
         summary.offers = byArticle.size;
+        summary.ms = Date.now() - sellerStart;
         offersBySeller[seller] = [...byArticle.values()];
         sellerSummaries.push(summary);
         done += 1;
@@ -1850,8 +2061,9 @@
           addOffers(page1.offers);
           let hasNext = page1.hasNext;
           let lastPrice = page1.offers.at(-1)?.priceCents ?? 0;
+          let interrupted = false;
           for (let pageNumber = 2; hasNext && pageNumber <= maxFullPages && lastPrice <= maxPriceCents; pageNumber += 1) {
-            if (runner.blocked()) break;
+            if (runner.blocked()) { interrupted = true; break; }
             const page = await call('sellerTokens', seller, { maxPriceEur, rarity: 24, pageNumber, sortBy: 'price_asc' });
             summary.pages += 1;
             addOffers(page.offers);
@@ -1859,15 +2071,24 @@
             if (page.offers.length) lastPrice = page.offers.at(-1).priceCents;
             else break;
           }
-          const list = [...byArticle.values()];
-          cache?.set(fullCacheKey, { at: Date.now(), value: { mode: 'full', total: page1.total, offers: list } });
+          if (interrupted || runner.blocked()) {
+            summary.status = 'blocked';
+            summary.error = runner.blocked()?.message || 'Blocked';
+          } else {
+            const list = [...byArticle.values()];
+            cache?.set(fullCacheKey, { at: Date.now(), value: { mode: 'full', total: page1.total, offers: list } });
+          }
         } else {
           summary.mode = rarityIgnored ? 'targeted-fallback' : 'targeted';
           for (const o of page1.offers) {
             if (!tokenIds || (o.idProduct != null && tokenIds.has(o.idProduct))) addOffers([o]);
           }
           for (const term of searchTerms) {
-            if (runner.blocked()) break;
+            if (runner.blocked()) {
+              summary.status = 'blocked';
+              summary.error = runner.blocked()?.message || 'Blocked';
+              break;
+            }
             const termKey = `tokens-q|${seller}|${maxPriceCents}|${term.toLowerCase()}`;
             const termHit = cache?.get(termKey);
             if (termHit && Date.now() - termHit.at < cacheMaxAgeMs) {
@@ -1877,8 +2098,9 @@
             }
             const termOffers = [];
             let hasNext = true;
+            let termInterrupted = false;
             for (let pageNumber = 1; hasNext && pageNumber <= maxSearchPages; pageNumber += 1) {
-              if (runner.blocked()) break;
+              if (runner.blocked()) { termInterrupted = true; break; }
               const page = await call('sellerTokens', seller, {
                 maxPriceEur,
                 rarity: rarityIgnored ? null : 24,
@@ -1891,6 +2113,11 @@
               hasNext = page.hasNext && (!page.offers.length ? false : page.offers.at(-1).priceCents <= maxPriceCents);
             }
             addOffers(termOffers);
+            if (termInterrupted || runner.blocked()) {
+              summary.status = 'blocked';
+              summary.error = runner.blocked()?.message || 'Blocked';
+              break;
+            }
             cache?.set(termKey, { at: Date.now(), value: { mode: 'term', offers: termOffers } });
           }
         }
@@ -1900,6 +2127,7 @@
         summary.error = error.message;
       }
 
+      summary.ms = Date.now() - sellerStart;
       offersBySeller[seller] = [...byArticle.values()];
       sellerSummaries.push(summary);
       done += 1;
@@ -1953,7 +2181,7 @@
   }
 
   root.CardmarketCollector = {
-    collect, collectBySellers, collectSellerTokens, createRunner, expansionGroups, browserSite, RefusedError, CartRejectError,
+    collect, collectBySellers, collectSellerTokens, createRunner, expansionGroups, browserSite, RefusedError, CartRejectError, TokenExpiredError,
     parseUserOffersPage,
     parseWantsList, parseWantsListName, parseWantsOverview, parseProductPageMeta, parseOfferRow, parseProductOfferRow,
     cents, allCents, RetryableError, BlockedError, StoppedError, LANGUAGES, CONDITIONS, CACHE_MAX_AGE_MS,

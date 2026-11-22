@@ -52,6 +52,8 @@
     return bar;
   }
 
+  const normaliseProductPath = path => String(path || '').replace(/^\/[^/]+\//, '/en/');
+
   // 1. Wants List page
   const wantsMatch = /\/(Magic|YuGiOh)\/Wants\/(\d+)/.exec(location.pathname);
   if (wantsMatch && document.querySelector('td.name a')) {
@@ -106,7 +108,7 @@
       for (const small of titleClone.querySelectorAll('small, span.h4, .subtitle')) small.remove();
     }
     const name = (titleClone?.textContent || document.title || 'Product').replace(/\s*\|.*$/, '').replace(/\s+/g, ' ').trim();
-    const productPath = location.pathname;
+    const productPath = normaliseProductPath(location.pathname);
 
     const bar = makeBar(`
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -133,7 +135,7 @@
 
     const refreshState = async () => {
       const { extraProducts = [] } = await chrome.storage.local.get('extraProducts');
-      const existing = extraProducts.find(p => p.productPath === productPath);
+      const existing = extraProducts.find(p => normaliseProductPath(p.productPath) === productPath);
       if (existing) {
         statusEl.textContent = `In Better Wizard (qty ${existing.amount}) — will be optimised alongside your cards.`;
         addBtn.textContent = `+ Add another (qty ${existing.amount})`;
@@ -143,10 +145,12 @@
 
     addBtn.addEventListener('click', async () => {
       const { extraProducts = [] } = await chrome.storage.local.get('extraProducts');
-      const existing = extraProducts.find(p => p.productPath === productPath);
+      const existing = extraProducts.find(p => normaliseProductPath(p.productPath) === productPath);
       if (existing) {
         existing.amount = (existing.amount || 1) + 1;
         existing.enabled = true;
+        existing.productPath = productPath;
+        existing.url = location.origin + productPath;
       } else {
         extraProducts.push({
           id: `prod:${idProduct || productPath}`,

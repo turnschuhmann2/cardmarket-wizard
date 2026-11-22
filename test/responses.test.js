@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 require('../collector.js');
-const { browserSite, createRunner, BlockedError, StoppedError, RefusedError, RetryableError, CartRejectError } = globalThis.CardmarketCollector;
+const { browserSite, createRunner, BlockedError, StoppedError, RefusedError, RetryableError, CartRejectError, TokenExpiredError } = globalThis.CardmarketCollector;
 
 globalThis.location = { href: 'https://www.cardmarket.com/en/Magic/Wants/1' };
 const reply = (status, title, headers = {}) => async () => ({
@@ -197,13 +197,17 @@ test('browserSite cartRequest classifies XML rejections vs HTML errors and refre
       err => !(err instanceof CartRejectError) && /without a result code/i.test(err.message),
     );
 
-    // 3. Explicit XML token rejection refreshes token once and retries
+    // 3. Explicit XML token rejection clears cached token and throws TokenExpiredError (no unpaced auto-retry)
     let postCount = 0;
+    let getCount = 0;
     const postedTokens = [];
     const site4 = browserSite({
       getToken: async () => 'OLD_TOK',
       fetchImpl: async (url, init) => {
-        if (url.endsWith('/ShoppingCart')) return okReply(url, '<input name="__cmtkn" value="NEW_TOK">');
+        if (url.endsWith('/ShoppingCart')) {
+          getCount += 1;
+          return okReply(url, '<input name="__cmtkn" value="NEW_TOK">');
+        }
         postCount += 1;
         postedTokens.push(init.body.get('__cmtkn'));
         if (postCount === 1) {
@@ -212,6 +216,14 @@ test('browserSite cartRequest classifies XML rejections vs HTML errors and refre
         return okReply(url, `<response><resultsCode>${b64('generalOK')}</resultsCode></response>`);
       },
     });
+    await assert.rejects(
+      site4.addSellerToCart([{ idArticle: 7, amount: 2 }], 'Magic'),
+      err => err instanceof TokenExpiredError && !(err instanceof CartRejectError),
+    );
+    assert.equal(getCount, 0, 'cartRequest must not issue unpaced GETs on token expiry');
+    assert.deepEqual(postedTokens, ['OLD_TOK']);
+    // Caller-driven paced refreshToken + retry succeeds cleanly with NEW_TOK.
+    await site4.refreshToken('Magic');
     await site4.addSellerToCart([{ idArticle: 7, amount: 2 }], 'Magic');
     assert.deepEqual(postedTokens, ['OLD_TOK', 'NEW_TOK']);
   } finally {
@@ -225,16 +237,21 @@ test('read path adaptively slows down on rate limits (debounced per wave) and re
   const runner = createRunner({
     async cardPage() {
       cardCalls += 1;
-      if (cardCalls <= 2) throw new RetryableError('HTTP 429', { cause: 'rate' });
+      const n = cardCalls;
+      // Simulate real network latency so both requests are genuinely in flight during the same wave.
+      if (n <= 2) {
+        await new Promise(r => setTimeout(r, 35));
+        throw new RetryableError('HTTP 429', { cause: 'rate' });
+      }
       return 'ok';
     },
   }, {
     concurrency: 2,
-    intervalMs: 20,
+    intervalMs: 10,
     bucketIntervals: {},
     jitter: false,
     recoverEvery: 3,
-    readRetryDelays: [25, 25, 25],
+    readRetryDelays: [40, 40, 40],
     log: e => events.push(e),
   });
 
@@ -243,7 +260,7 @@ test('read path adaptively slows down on rate limits (debounced per wave) and re
   const slowdowns = events.filter(e => e.type === 'pace-slowdown');
   assert.equal(slowdowns.length, 1, 'same-wave failures debounce to one multiplicative slowdown');
   const slowedMs = runner.pace.intervalMs;
-  assert.ok(slowedMs > 20, `expected slowed interval > 20, got ${slowedMs}`);
+  assert.ok(slowedMs > 10, `expected slowed interval > 10, got ${slowedMs}`);
 
   // Clean streak should recover pacing step-by-step back toward baseIntervalMs.
   for (let i = 0; i < 6; i += 1) await runner.call('cardPage');
