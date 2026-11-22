@@ -509,3 +509,16 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); f
 }
 .token-section-head h3 { margin: 0; font-size: 14px; font-weight: 700; }
 .token-covers-sub { font-size: 11.5px; color: var(--text-muted); display: block; margin-top: 2px; }
+
+/* Price per Wants List & Product Breakdown */
+.breakdown-table tfoot td {
+  border-top: 2px solid var(--border);
+  border-bottom: none;
+  background: var(--surface-subtle);
+  font-weight: 700;
+}
+.breakdown-source { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.breakdown-sub { font-size: 11.5px; color: var(--text-muted); margin-top: 2px; }
+.share-cell { display: inline-flex; align-items: center; gap: 6px; justify-content: flex-end; }
+.share-bar-wrap { width: 54px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: inline-block; }
+.share-bar { height: 100%; background: var(--primary); border-radius: 999px; }

@@ -599,8 +599,246 @@
     return { basket: () => describe(improve(rank())), optimise, revalidate, recommendCuts, topUp, apply, overlap };
   }
 
+  function allocateIntegerCents(totalCents, weightedItems) {
+    const out = new Map();
+    if (!weightedItems.length) return out;
+    if (!Number.isFinite(totalCents) || totalCents <= 0) {
+      for (const w of weightedItems) out.set(w.key, 0);
+      return out;
+    }
+    const weightSum = weightedItems.reduce((s, w) => s + (w.weight > 0 ? w.weight : 0), 0);
+    const effective = weightSum > 0
+      ? weightedItems
+      : weightedItems.map(w => ({ ...w, weight: 1 }));
+    const denom = effective.reduce((s, w) => s + w.weight, 0);
+
+    const parts = effective.map(w => {
+      const exact = (totalCents * w.weight) / denom;
+      const floor = Math.floor(exact);
+      return { key: w.key, weight: w.weight, floor, rem: exact - floor };
+    });
+    let remainder = totalCents - parts.reduce((s, p) => s + p.floor, 0);
+    parts.sort((a, b) => b.rem - a.rem || b.weight - a.weight || a.key.localeCompare(b.key));
+    for (let i = 0; i < parts.length; i += 1) {
+      out.set(parts[i].key, parts[i].floor + (i < remainder ? 1 : 0));
+    }
+    return out;
+  }
+
+  function sourceMetaForItem(item) {
+    const kind = item.kind || 'card';
+    const game = item.game || 'Magic';
+    if (kind === 'product') {
+      const id = item.key || (item.idProduct != null ? String(item.idProduct) : item.name || 'product');
+      return {
+        key: `product:${id}`,
+        kind: 'product',
+        game,
+        listId: null,
+        listName: null,
+        label: item.name || 'Extra Product',
+      };
+    }
+    if (kind === 'token') {
+      const deck = item.listName || 'Default';
+      return {
+        key: `token:${deck}`,
+        kind: 'token',
+        game: 'Magic',
+        listId: item.listId ?? `token:${deck}`,
+        listName: deck,
+        label: deck !== 'Default' ? `Tokens: ${deck}` : 'Magic Tokens',
+      };
+    }
+    const gameText = game === 'YuGiOh' ? 'Yu-Gi-Oh!' : 'Magic';
+    const hasListId = item.listId != null && item.listId !== '';
+    const key = hasListId
+      ? `list:${game}:${item.listId}`
+      : item.listName
+        ? `name:${game}:${item.listName}`
+        : `game:${game}`;
+    const label = item.listName || (hasListId ? `${gameText} Wants #${item.listId}` : gameText);
+    return {
+      key,
+      kind: 'card',
+      game,
+      listId: hasListId ? String(item.listId) : null,
+      listName: item.listName || null,
+      label,
+    };
+  }
+
+  // Summarizes items cost, allocated shipping share, and total per Wants List, per Extra Product,
+  // and per Token deck. Dedicated parcels attribute 100% of shipping to their single source; shared
+  // parcels split shipping proportionally (by card count for card-only parcels, or by standalone
+  // shipping weight when products and cards share a parcel) with exact-cent largest-remainder rounding.
+  function summarizeBasketBySource(parcels, { tables = null, trackedOnly = [], missing = [], leftOut = [] } = {}) {
+    const { defaultTable, byLocation } = tables ? normaliseTables(tables) : { defaultTable: null, byLocation: {} };
+    const trackedSet = new Set(trackedOnly || []);
+    const tableForParcel = parcel => {
+      if (!defaultTable) return null;
+      const base = (parcel.location && byLocation[parcel.location]) || defaultTable;
+      return trackedSet.has(parcel.seller) ? base.filter(m => m.tracked) : base;
+    };
+
+    const groups = new Map();
+    const ensureGroup = meta => {
+      let g = groups.get(meta.key);
+      if (!g) {
+        g = {
+          ...meta,
+          itemCount: 0,
+          missingCount: 0,
+          leftOutCount: 0,
+          itemsCents: 0,
+          shippingCents: 0,
+          sellers: new Set(),
+          sharedSellers: new Set(),
+          unknownShipping: false,
+        };
+        groups.set(meta.key, g);
+      }
+      return g;
+    };
+
+    let hasSharedParcels = false;
+    let totalShippingCents = 0;
+    let totalItemsCents = 0;
+    let totalItemCount = 0;
+
+    for (const parcel of parcels || []) {
+      const items = parcel.items || [];
+      if (!items.length) continue;
+
+      const bySource = new Map();
+      let parcelHasProduct = false;
+      for (const item of items) {
+        const meta = sourceMetaForItem(item);
+        const g = ensureGroup(meta);
+        const price = Number.isFinite(item.priceCents) ? item.priceCents : 0;
+        g.itemCount += 1;
+        g.itemsCents += price;
+        g.sellers.add(parcel.seller);
+        totalItemCount += 1;
+        totalItemsCents += price;
+        if (meta.kind === 'product') parcelHasProduct = true;
+
+        let local = bySource.get(meta.key);
+        if (!local) {
+          local = { key: meta.key, kind: meta.kind, count: 0, itemsCents: 0, rawItems: [] };
+          bySource.set(meta.key, local);
+        }
+        local.count += 1;
+        local.itemsCents += price;
+        local.rawItems.push(item);
+      }
+
+      const ship = Number.isFinite(parcel.shippingCents) ? parcel.shippingCents : 0;
+      const finiteShip = Number.isFinite(parcel.shippingCents);
+      if (finiteShip) totalShippingCents += ship;
+
+      const sourceList = [...bySource.values()];
+      if (sourceList.length === 1) {
+        const g = groups.get(sourceList[0].key);
+        if (finiteShip) g.shippingCents += ship;
+        else g.unknownShipping = true;
+      } else {
+        hasSharedParcels = true;
+        const parcelTable = tableForParcel(parcel);
+        const weighted = sourceList.map(local => {
+          let weight = local.count;
+          if (parcelHasProduct) {
+            if (parcelTable && parcelTable.length) {
+              const simItems = local.rawItems.map(it => ({
+                kind: it.kind || 'card',
+                offer: { shippingCents: it.offerShippingCents ?? null },
+              }));
+              const standalone = parcelShipping(parcelTable, simItems, local.itemsCents);
+              if (standalone && Number.isFinite(standalone.priceCents) && standalone.priceCents > 0) {
+                weight = standalone.priceCents;
+              }
+            }
+            if (weight === local.count) {
+              if (local.kind === 'product') {
+                const quotes = local.rawItems.map(it => it.offerShippingCents).filter(v => typeof v === 'number' && v > 0);
+                weight = quotes.length ? Math.max(...quotes) : 350;
+              } else {
+                weight = local.count <= 4 ? 125 : local.count <= 17 ? 225 : 450;
+              }
+            }
+          }
+          return { key: local.key, weight };
+        });
+
+        const alloc = finiteShip ? allocateIntegerCents(ship, weighted) : null;
+        for (const local of sourceList) {
+          const g = groups.get(local.key);
+          g.sharedSellers.add(parcel.seller);
+          if (alloc) g.shippingCents += alloc.get(local.key) || 0;
+          else g.unknownShipping = true;
+        }
+      }
+    }
+
+    for (const item of missing || []) {
+      const meta = sourceMetaForItem(item);
+      const g = groups.get(meta.key);
+      if (g) g.missingCount += 1;
+    }
+    for (const item of leftOut || []) {
+      const meta = sourceMetaForItem(item);
+      const g = groups.get(meta.key);
+      if (g) g.leftOutCount += item.amount || 1;
+    }
+
+    const list = [...groups.values()];
+    const labelCounts = new Map();
+    for (const g of list) labelCounts.set(g.label, (labelCounts.get(g.label) || 0) + 1);
+
+    const grandTotalCents = totalItemsCents + totalShippingCents;
+    const kindOrder = { card: 0, product: 1, token: 2 };
+    const rows = list.map(g => {
+      const totalCents = g.itemsCents + g.shippingCents;
+      const label = labelCounts.get(g.label) > 1 && g.listId != null ? `${g.label} (#${g.listId})` : g.label;
+      return {
+        key: g.key,
+        kind: g.kind,
+        game: g.game,
+        listId: g.listId,
+        listName: g.listName,
+        label,
+        itemCount: g.itemCount,
+        missingCount: g.missingCount,
+        leftOutCount: g.leftOutCount,
+        sellerCount: g.sellers.size,
+        sharedSellerCount: g.sharedSellers.size,
+        itemsCents: g.itemsCents,
+        shippingCents: g.shippingCents,
+        totalCents,
+        sharePct: grandTotalCents > 0 ? Math.round((totalCents / grandTotalCents) * 100) : 0,
+        unknownShipping: g.unknownShipping,
+      };
+    }).sort((a, b) =>
+      (kindOrder[a.kind] ?? 9) - (kindOrder[b.kind] ?? 9)
+      || b.totalCents - a.totalCents
+      || a.label.localeCompare(b.label)
+    );
+
+    return {
+      rows,
+      totals: {
+        itemCount: totalItemCount,
+        itemsCents: totalItemsCents,
+        shippingCents: totalShippingCents,
+        totalCents: grandTotalCents,
+        sellerCount: (parcels || []).length,
+        hasSharedParcels,
+      },
+    };
+  }
+
   root.CardmarketWizard = {
     createPlanner, parseShippingTable, shipping, shippingByWeight, parcelShipping, weightOf,
-    scopeKey, matchesScope, effectiveLimitRule, filterByLimits, STRATEGIES,
+    scopeKey, matchesScope, effectiveLimitRule, filterByLimits, summarizeBasketBySource, STRATEGIES,
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

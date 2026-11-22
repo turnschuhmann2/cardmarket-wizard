@@ -8,7 +8,7 @@
     collect, collectBySellers, collectSellerTokens, createRunner, browserSite, BlockedError, RetryableError, RefusedError, CACHE_MAX_AGE_MS,
   } = globalThis.CardmarketCollector;
   const {
-    parseShippingTable, parcelShipping, scopeKey, filterByLimits, matchesScope,
+    parseShippingTable, parcelShipping, scopeKey, filterByLimits, matchesScope, summarizeBasketBySource,
   } = globalThis.CardmarketWizard;
   const {
     collectBasketEntries, collectLeftOutEntries, groupExportEntries,
@@ -930,6 +930,123 @@
     });
   }
 
+  let lastBreakdown = null;
+
+  function renderBreakdown() {
+    const card = $('breakdownCard');
+    const b = activeBasket();
+    if (!b || !b.parcels?.length) {
+      lastBreakdown = null;
+      if (card) card.hidden = true;
+      return;
+    }
+    const max = b.parcels.length;
+    const n = Math.min(max, Math.max(1, Number($('buySellers').value) || max));
+    const parcels = b.parcels.slice(0, n);
+    const summary = summarizeBasketBySource(parcels, {
+      tables: state.currentTables,
+      trackedOnly: Object.keys(state.trackedSellers),
+      missing: b.missing || [],
+      leftOut: state.leftOut || [],
+    });
+    lastBreakdown = { summary, n, max };
+
+    if (!summary.rows.length) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+
+    const scopeText = n < max ? `First ${n} of ${max} sellers` : `${max} seller${max === 1 ? '' : 's'}`;
+    $('breakdownScopeBadge').textContent = scopeText;
+    $('breakdownHint').textContent = summary.totals.hasSharedParcels
+      ? 'Exact item totals per Wants List and product. Shared-seller shipping is split proportionally so all rows sum to the exact basket total.'
+      : 'Exact item and shipping totals per Wants List and product.';
+
+    const badgeFor = row => {
+      if (row.kind === 'product') return '<span class="badge badge-product">Product</span>';
+      if (row.kind === 'token') return '<span class="badge badge-token">Tokens</span>';
+      return `<span class="badge ${row.game === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${row.game === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`;
+    };
+
+    const unitWord = row => (row.kind === 'product' ? (row.itemCount === 1 ? 'unit' : 'units')
+      : row.kind === 'token' ? (row.itemCount === 1 ? 'token' : 'tokens')
+        : (row.itemCount === 1 ? 'card' : 'cards'));
+
+    const rowsHtml = summary.rows.map(row => {
+      const notes = [];
+      if (row.leftOutCount > 0) notes.push(`${row.leftOutCount} left out`);
+      if (row.missingCount > 0) notes.push(`${row.missingCount} unavailable`);
+      const shipNote = row.sharedSellerCount > 0
+        ? `title="Includes proportional share from ${row.sharedSellerCount} combined seller parcel${row.sharedSellerCount === 1 ? '' : 's'}"`
+        : '';
+      return `
+        <tr>
+          <td>
+            <div class="breakdown-source">
+              ${badgeFor(row)}
+              <strong>${esc(row.label)}</strong>
+            </div>
+            ${notes.length ? `<div class="breakdown-sub">${esc(notes.join(' · '))}</div>` : ''}
+          </td>
+          <td class="num">
+            <strong>${row.itemCount}</strong> ${unitWord(row)}
+            <div class="breakdown-sub">${row.sellerCount} seller${row.sellerCount === 1 ? '' : 's'}${row.sharedSellerCount ? ` (${row.sharedSellerCount} shared)` : ''}</div>
+          </td>
+          <td class="num">${euros(row.itemsCents)}</td>
+          <td class="num" ${shipNote}>${row.unknownShipping ? '–' : euros(row.shippingCents)}${row.sharedSellerCount ? ' *' : ''}</td>
+          <td class="num"><strong>${euros(row.totalCents)}</strong></td>
+          <td class="num">
+            <span class="share-cell">
+              <span class="share-bar-wrap"><span class="share-bar" style="width:${row.sharePct}%"></span></span>
+              <span style="min-width:30px;font-size:12px;color:var(--text-muted)">${row.sharePct}%</span>
+            </span>
+          </td>
+        </tr>`;
+    }).join('');
+
+    const t = summary.totals;
+    $('breakdownTableWrap').innerHTML = `
+      <table class="data-table breakdown-table">
+        <thead>
+          <tr>
+            <th>Wants List / Product</th>
+            <th class="num">Items</th>
+            <th class="num">Items Cost</th>
+            <th class="num">${t.hasSharedParcels ? 'Est. Shipping' : 'Shipping'}</th>
+            <th class="num">Total</th>
+            <th class="num">Share</th>
+          </tr>
+        </thead>
+        <tbody>${rowsHtml}</tbody>
+        <tfoot>
+          <tr>
+            <td>Total (${esc(scopeText)})</td>
+            <td class="num">${t.itemCount} items</td>
+            <td class="num">${euros(t.itemsCents)}</td>
+            <td class="num">${euros(t.shippingCents)}</td>
+            <td class="num">${euros(t.totalCents)}</td>
+            <td class="num">100%</td>
+          </tr>
+        </tfoot>
+      </table>`;
+  }
+
+  async function copyBreakdownSummary() {
+    if (!lastBreakdown?.summary?.rows?.length) return;
+    const { summary, n, max } = lastBreakdown;
+    const scope = n < max ? `first ${n} of ${max} sellers` : `${max} sellers`;
+    const lines = [
+      `Cardmarket Better Wizard — Cost Breakdown (${scope})`,
+      ...summary.rows.map(r =>
+        `- ${r.label}: ${euros(r.totalCents)} (${euros(r.itemsCents)} items + ${euros(r.shippingCents)} shipping, ${r.itemCount} items)`
+      ),
+      `Total: ${euros(summary.totals.totalCents)} (${euros(summary.totals.itemsCents)} items + ${euros(summary.totals.shippingCents)} shipping)`,
+    ];
+    await navigator.clipboard.writeText(lines.join('\n'));
+    toast('Copied price breakdown summary.', 'success');
+  }
+
   function updateBuySummary() {
     const b = activeBasket();
     if (!b) return;
@@ -937,6 +1054,7 @@
     const n = Math.min(max, Math.max(1, Number($('buySellers').value) || max));
     const pt = b.curve[n - 1];
     $('buySummary').textContent = pt ? `${pt.cards} items · ${euros(pt.totalCents)} total` : '';
+    renderBreakdown();
     updateExportButtons();
   }
 
@@ -2577,6 +2695,7 @@
     $('btnReoptTokens').addEventListener('click', () => reoptimiseTokensFromMemory({ resetBuySellers: false, silent: false }));
     $('btnExpandAllSellers').addEventListener('click', () => setAllSellersExpanded(true));
     $('btnCollapseAllSellers').addEventListener('click', () => setAllSellersExpanded(false));
+    $('btnCopyBreakdown').addEventListener('click', copyBreakdownSummary);
     $('btnBuy').addEventListener('click', addToCart);
     $('btnCheckCart').addEventListener('click', () => checkCart());
     $('btnCopyPlain').addEventListener('click', () => handleExportEntries(basketEntries(), 'plain', 'basket items'));
