@@ -4,7 +4,7 @@
 
 importScripts('wizard.js');
 
-const { createPlanner, filterByLimits, scopeKey, matchesScope, STRATEGIES } = self.CardmarketWizard;
+const { createPlanner, filterByLimits, previewLimitLeftOut, scopeKey, matchesScope, STRATEGIES } = self.CardmarketWizard;
 
 function serializeBasket(basket) {
   const picks = [...basket.assignment].map(([unitId, { seller, offer }]) => ({
@@ -98,8 +98,8 @@ self.onmessage = async event => {
 
       const options = [];
       for (const cents of candidates) {
-        const overInScope = scopedCards.filter(r => r.targetCents !== null && r.targetCents > cents);
-        if (!overInScope.length || overInScope.length === scopedCards.length) continue;
+        const preview = previewLimitLeftOut(collection.results, activeLimits, manualCuts, scope, cents);
+        if (!preview.items.length || preview.items.length === preview.scopedEligibleCount) continue;
 
         const trialRules = [...baseRules, { ...scope, cents }];
         const { kept } = filterByLimits(collection.results, trialRules, manualCuts);
@@ -109,8 +109,8 @@ self.onmessage = async event => {
 
         const option = {
           cents,
-          cards: overInScope.reduce((sum, r) => sum + (r.amount || 1), 0),
-          leftOutCents: overInScope.reduce((sum, r) => sum + r.targetCents * (r.amount || 1), 0),
+          cards: preview.totalCopies,
+          leftOutCents: preview.totalMarketCents,
           basketCents: quick.totalCents,
           savesCents: baseQuick.totalCents - quick.totalCents,
         };

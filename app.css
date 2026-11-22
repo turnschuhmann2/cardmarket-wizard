@@ -272,6 +272,20 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); f
 }
 .scope-pill:hover { border-color: var(--primary); color: var(--primary); }
 .scope-pill.active { background: var(--primary); border-color: var(--primary); color: #fff; }
+.limit-cell { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.btn-info-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 19px; height: 19px; padding: 0; border-radius: 50%;
+  border: 1px solid var(--border-strong); background: var(--surface);
+  color: var(--text-muted); font-family: Georgia, "Times New Roman", serif;
+  font-size: 11.5px; font-style: italic; font-weight: 700; line-height: 1;
+  cursor: pointer; transition: all 0.12s; flex-shrink: 0;
+}
+.btn-info-icon:hover,
+.btn-info-icon:focus-visible {
+  border-color: var(--primary); background: var(--primary-soft); color: var(--primary);
+  outline: none; box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.16);
+}
 
 /* Left-out & Cuts */
 .leftout-bar {
@@ -420,6 +434,25 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); f
   padding-top: 12px; border-top: 1px solid var(--border);
 }
 .export-footer-left { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* Price Limit Left-Out Cards Modal */
+.limit-info-modal-card { max-width: 620px; }
+.limit-info-body {
+  max-height: 380px; overflow-y: auto; margin-bottom: 16px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.limit-info-body .data-table { margin: 0; }
+.limit-info-body .data-table thead th {
+  position: sticky; top: 0; z-index: 1; background: var(--surface-subtle);
+  box-shadow: inset 0 -1px 0 var(--border); border-bottom: none;
+}
+.limit-info-body .data-table tfoot td {
+  position: sticky; bottom: 0; z-index: 1; background: var(--surface-subtle);
+  box-shadow: inset 0 1px 0 var(--border); border-bottom: none; font-weight: 700;
+}
+.limit-info-empty {
+  padding: 20px 14px; text-align: center; color: var(--text-muted); font-size: 13px;
+}
 
 /* Toasts */
 .toast-host { position: fixed; right: 20px; bottom: 20px; z-index: 120; display: flex; flex-direction: column; gap: 8px; }

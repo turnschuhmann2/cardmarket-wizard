@@ -8,7 +8,7 @@
     collect, collectBySellers, collectSellerTokens, createRunner, browserSite, BlockedError, RetryableError, RefusedError, CACHE_MAX_AGE_MS,
   } = globalThis.CardmarketCollector;
   const {
-    parseShippingTable, parcelShipping, scopeKey, filterByLimits, matchesScope, summarizeBasketBySource,
+    parseShippingTable, parcelShipping, scopeKey, filterByLimits, previewLimitLeftOut, matchesScope, summarizeBasketBySource,
     basketItemSignature, applyBasketRemovals,
   } = globalThis.CardmarketWizard;
   const {
@@ -157,7 +157,10 @@
     limitsOpen: false,
     limitEstimateJobId: 0,
     limitOptions: [],
+    limitPartialOptions: [],
     limitBaselineCents: null,
+    selectedLimitChoice: null,
+    limitInfoModalState: null,
     optimiseJobId: 0,
     optimising: false,
     fetching: false,
@@ -719,11 +722,109 @@
     });
   }
 
+  function closeLimitInfoModal() {
+    const modal = $('limitInfoModal');
+    if (modal) modal.hidden = true;
+    state.limitInfoModalState = null;
+  }
+
+  function openLimitInfoModal(cents, { isCustom = false } = {}) {
+    if (!state.collection || !(cents > 0)) return;
+    const scope = state.limitScope;
+    const preview = previewLimitLeftOut(
+      state.collection.results || [],
+      state.activeLimits,
+      state.manualCuts,
+      scope,
+      cents,
+    );
+    const pool = state.limitOptions.length ? state.limitOptions : state.limitPartialOptions;
+    const opt = pool.find(o => o.cents === cents) || null;
+
+    $('limitInfoModalTitle').textContent = `Cards left out (> ${euros(cents)})`;
+    const subParts = [
+      scope.label,
+      `${preview.totalCopies} card${preview.totalCopies === 1 ? '' : 's'}`,
+      `Market total ${euros(preview.totalMarketCents)}`,
+    ];
+    if (opt && Number.isFinite(opt.savesCents)) {
+      subParts.push(`Est. saves ${euros(opt.savesCents)}`);
+    }
+    $('limitInfoModalSub').textContent = subParts.join(' · ');
+
+    const body = $('limitInfoModalBody');
+    if (!preview.items.length) {
+      body.innerHTML = `<div class="limit-info-empty">No cards in <strong>${esc(scope.label)}</strong> have a market price above <strong>${euros(cents)}</strong>.</div>`;
+    } else {
+      const showSource = new Set(preview.items.map(i => i.game)).size > 1 || preview.items.some(i => i.listName);
+      const hasMultiQty = preview.items.some(i => i.amount > 1);
+      const labelCols = 1 + (showSource ? 1 : 0) + (hasMultiQty ? 1 : 0);
+      body.innerHTML = `
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Card</th>
+              ${showSource ? '<th>Source</th>' : ''}
+              ${hasMultiQty ? '<th class="num">Qty</th>' : ''}
+              <th class="num">Market</th>
+              <th class="num">Cheapest</th>
+              ${hasMultiQty ? '<th class="num">Total</th>' : ''}
+            </tr>
+          </thead>
+          <tbody>
+            ${preview.items.map(item => `
+              <tr>
+                <td><strong>${esc(item.name)}</strong></td>
+                ${showSource ? `<td><span class="badge ${item.game === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${item.game === 'YuGiOh' ? 'YGO' : 'MTG'}</span>${item.listName ? ` <span style="font-size:12px;color:var(--text-muted)">${esc(item.listName)}</span>` : ''}</td>` : ''}
+                ${hasMultiQty ? `<td class="num">${item.amount}&times;</td>` : ''}
+                <td class="num">${hasMultiQty ? euros(item.targetCents) : `<strong>${euros(item.targetCents)}</strong>`}</td>
+                <td class="num" style="color:var(--text-muted)">${euros(item.cheapestOfferCents)}</td>
+                ${hasMultiQty ? `<td class="num"><strong>${euros(item.totalMarketCents)}</strong></td>` : ''}
+              </tr>`).join('')}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td colspan="${labelCols}">Total (${preview.totalCopies} card${preview.totalCopies === 1 ? '' : 's'})</td>
+              ${hasMultiQty ? '<td></td><td></td>' : ''}
+              <td class="num">${euros(preview.totalMarketCents)}</td>
+              ${hasMultiQty ? '' : '<td></td>'}
+            </tr>
+          </tfoot>
+        </table>`;
+    }
+
+    const selectBtn = $('limitInfoSelect');
+    state.limitInfoModalState = { cents, isCustom };
+    selectBtn.textContent = `Select ≤ ${euros(cents)}`;
+    selectBtn.hidden = false;
+    $('limitInfoModal').hidden = false;
+  }
+
+  function selectLimitFromModal() {
+    const info = state.limitInfoModalState;
+    if (!info) return;
+    if (info.isCustom) {
+      state.selectedLimitChoice = 'custom';
+      const radio = document.querySelector('input[name="bwLimit"][value="custom"]');
+      if (radio) radio.checked = true;
+    } else {
+      state.selectedLimitChoice = String(info.cents);
+      const radio = document.querySelector(`input[name="bwLimit"][value="${info.cents}"]`);
+      if (radio) radio.checked = true;
+    }
+    closeLimitInfoModal();
+  }
+
   function renderLimitsSkeleton(rows = 5, partial = []) {
     const existingRows = partial.map(opt => `
       <tr>
-        <td><input type="radio" name="bwLimit" value="${opt.cents}"></td>
-        <td><strong>${euros(opt.cents)}</strong></td>
+        <td><input type="radio" name="bwLimit" value="${opt.cents}" ${state.selectedLimitChoice === String(opt.cents) ? 'checked' : ''}></td>
+        <td>
+          <span class="limit-cell">
+            <strong>${euros(opt.cents)}</strong>
+            <button type="button" class="btn-info-icon" data-limit-info="${opt.cents}" title="Show cards left out above ${euros(opt.cents)}" aria-label="Show cards left out above ${euros(opt.cents)}">i</button>
+          </span>
+        </td>
         <td class="num">${opt.cards}</td>
         <td class="num">${euros(opt.leftOutCents)}</td>
         <td class="num">${euros(opt.basketCents)}</td>
@@ -756,15 +857,32 @@
       (scope.type === 'list' && (r.type === 'game' || r.type === 'all')) ||
       (scope.type === 'game' && r.type === 'all')
     );
-    const rows = state.limitOptions.map(opt => `
+    const hasExplicit = state.selectedLimitChoice !== null && (
+      state.selectedLimitChoice === 'custom' ||
+      (state.selectedLimitChoice === 'none' && hasBroader) ||
+      state.limitOptions.some(o => String(o.cents) === state.selectedLimitChoice)
+    );
+    const rows = state.limitOptions.map(opt => {
+      const isChecked = hasExplicit ? state.selectedLimitChoice === String(opt.cents) : Boolean(opt.suggested);
+      return `
       <tr>
-        <td><input type="radio" name="bwLimit" value="${opt.cents}" ${opt.suggested ? 'checked' : ''}></td>
-        <td><strong>${euros(opt.cents)}</strong> ${opt.suggested ? '<span class="badge badge-indigo">suggested</span>' : ''}</td>
+        <td><input type="radio" name="bwLimit" value="${opt.cents}" ${isChecked ? 'checked' : ''}></td>
+        <td>
+          <span class="limit-cell">
+            <strong>${euros(opt.cents)}</strong>
+            <button type="button" class="btn-info-icon" data-limit-info="${opt.cents}" title="Show cards left out above ${euros(opt.cents)}" aria-label="Show cards left out above ${euros(opt.cents)}">i</button>
+            ${opt.suggested ? '<span class="badge badge-indigo">suggested</span>' : ''}
+          </span>
+        </td>
         <td class="num">${opt.cards}</td>
         <td class="num">${euros(opt.leftOutCents)}</td>
         <td class="num">${euros(opt.basketCents)}</td>
         <td class="num" style="color:var(--emerald);font-weight:700">${euros(opt.savesCents)}</td>
-      </tr>`).join('');
+      </tr>`;
+    }).join('');
+
+    const customChecked = hasExplicit ? state.selectedLimitChoice === 'custom' : !state.limitOptions.length;
+    const noneChecked = hasExplicit && state.selectedLimitChoice === 'none';
 
     const emptyMsg = !state.limitOptions.length
       ? '<p class="card-hint">No preset limit leaves out a subset of cards in this scope — you can still enter a custom limit below.</p>'
@@ -779,14 +897,17 @@
         <tbody>
           ${rows}
           <tr>
-            <td><input type="radio" name="bwLimit" value="custom" ${!state.limitOptions.length ? 'checked' : ''}></td>
+            <td><input type="radio" name="bwLimit" value="custom" ${customChecked ? 'checked' : ''}></td>
             <td colspan="5">
-              Other: <input id="customLimitInput" class="input" style="width:90px;display:inline-block" placeholder="1,50"> €
+              <span class="limit-cell">
+                Other: <input id="customLimitInput" class="input" style="width:90px;display:inline-block" placeholder="1,50"> €
+                <button type="button" class="btn-info-icon" data-limit-info="custom" title="Show cards left out for this custom limit" aria-label="Show cards left out for custom limit">i</button>
+              </span>
             </td>
           </tr>
           ${hasBroader ? `
           <tr>
-            <td><input type="radio" name="bwLimit" value="none"></td>
+            <td><input type="radio" name="bwLimit" value="none" ${noneChecked ? 'checked' : ''}></td>
             <td colspan="5"><strong>No limit for ${esc(scope.label)}</strong> <span class="card-hint">(overrides broader limit)</span></td>
           </tr>` : ''}
         </tbody>
@@ -803,6 +924,8 @@
     const myJob = ++state.limitEstimateJobId;
     state.limitOptions = [];
     const partial = [];
+    state.limitPartialOptions = partial;
+    state.selectedLimitChoice = null;
     renderLimitsSkeleton(5, partial);
     try {
       const res = await runWorker({
@@ -3092,10 +3215,43 @@
     $('btnCheckCart').addEventListener('click', () => checkCart());
     $('btnCopyPlain').addEventListener('click', () => handleExportEntries(basketEntries(), 'plain', 'basket items'));
     $('btnCopyArchidekt').addEventListener('click', () => handleExportEntries(basketEntries(), 'archidekt', 'Magic cards'));
+    $('limitsTableWrap').addEventListener('click', e => {
+      const infoBtn = e.target.closest('[data-limit-info]');
+      if (!infoBtn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const raw = infoBtn.dataset.limitInfo;
+      if (raw === 'custom') {
+        const inputVal = $('customLimitInput')?.value.replace(',', '.');
+        const centsVal = Math.round(Number(inputVal) * 100);
+        if (!(centsVal > 0)) {
+          toast('Enter a valid price limit in € to preview left-out cards.', 'error');
+          $('customLimitInput')?.focus();
+          return;
+        }
+        openLimitInfoModal(centsVal, { isCustom: true });
+        return;
+      }
+      const centsVal = Number(raw);
+      if (centsVal > 0) openLimitInfoModal(centsVal);
+    });
+    $('limitsTableWrap').addEventListener('change', e => {
+      if (e.target.matches('input[name="bwLimit"]')) {
+        state.selectedLimitChoice = e.target.value;
+      }
+    });
+    $('limitInfoModalClose').addEventListener('click', closeLimitInfoModal);
+    $('limitInfoModalCloseX').addEventListener('click', closeLimitInfoModal);
+    $('limitInfoSelect').addEventListener('click', selectLimitFromModal);
+    $('limitInfoModal').addEventListener('click', e => { if (e.target === $('limitInfoModal')) closeLimitInfoModal(); });
     $('exportModalClose').addEventListener('click', closeExportModal);
     $('exportModalCloseX').addEventListener('click', closeExportModal);
     $('exportModal').addEventListener('click', e => { if (e.target === $('exportModal')) closeExportModal(); });
-    document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('exportModal').hidden) closeExportModal(); });
+    document.addEventListener('keydown', e => {
+      if (e.key !== 'Escape') return;
+      if (!$('limitInfoModal').hidden) closeLimitInfoModal();
+      else if (!$('exportModal').hidden) closeExportModal();
+    });
     $('btnForgetCart').addEventListener('click', async () => {
       const { key } = await alreadyAdded();
       await chrome.storage.local.remove(key);

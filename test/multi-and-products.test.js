@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 require('../wizard.js');
 require('../collector.js');
 
-const { createPlanner, parseShippingTable, parcelShipping, filterByLimits, scopeKey } = globalThis.CardmarketWizard;
+const { createPlanner, parseShippingTable, parcelShipping, filterByLimits, previewLimitLeftOut, scopeKey } = globalThis.CardmarketWizard;
 const { collectBySellers, parseProductOfferRow, parseWantsOverview, parseWantsListName } = globalThis.CardmarketCollector;
 
 const deTable = parseShippingTable(require('./fixtures/shipping-de-de.json'));
@@ -137,6 +137,60 @@ test('scoped price limits support per-game, per-list, specificity precedence, an
   ]);
   assert.deepEqual(override.kept.map(r => r.key), ['m1', 'm3', 'p1']);
   assert.deepEqual(override.leftOut.map(r => r.key), ['m2', 'y1']);
+});
+
+test('previewLimitLeftOut returns sorted left-out cards with prices, respects scope overrides and manual cuts', () => {
+  const results = [
+    { key: 'm1', name: 'Cheap MTG', game: 'Magic', listId: '1', listName: 'Commander', kind: 'card', amount: 1, targetCents: 100, offers: [offer('A', 90)] },
+    { key: 'm2', name: 'Rhystic Study', game: 'Magic', listId: '1', listName: 'Commander', kind: 'card', amount: 1, targetCents: 2800, offers: [offer('A', 2950), offer('B', 2650)] },
+    { key: 'm3', name: 'Smothering Tithe', game: 'Magic', listId: '2', listName: 'Cube', kind: 'card', amount: 1, targetCents: 1800, offers: [] },
+    { key: 'y1', name: 'Ash Blossom', game: 'YuGiOh', listId: '3', listName: 'Main Deck', kind: 'card', amount: 3, targetCents: 450, offers: [offer('C', 410), offer('D', 500)] },
+    { key: 'm4', name: 'Manually Cut Card', game: 'Magic', listId: '1', listName: 'Commander', kind: 'card', amount: 1, targetCents: 900, offers: [offer('A', 850)] },
+    { key: 'p1', name: 'Dragon Shield Sleeves', game: 'Magic', listId: null, kind: 'product', amount: 1, targetCents: 900, offers: [offer('A', 900)] },
+  ];
+
+  // Preview All cards <= 3,00 EUR with an existing All cards <= 1,00 EUR (replaced cleanly),
+  // a more-specific override on List 2 (No limit -> m3 stays kept), and m4 manually cut.
+  const allPreview = previewLimitLeftOut(
+    results,
+    [
+      { type: 'all', cents: 100 },
+      { type: 'list', game: 'Magic', listId: '2', cents: null },
+    ],
+    ['m4'],
+    { type: 'all' },
+    300,
+  );
+  assert.deepEqual(allPreview.items.map(i => i.key), ['m2', 'y1']);
+  assert.equal(allPreview.items[0].targetCents, 2800);
+  assert.equal(allPreview.items[0].cheapestOfferCents, 2650);
+  assert.equal(allPreview.items[0].totalMarketCents, 2800);
+  assert.equal(allPreview.items[1].amount, 3);
+  assert.equal(allPreview.items[1].targetCents, 450);
+  assert.equal(allPreview.items[1].cheapestOfferCents, 410);
+  assert.equal(allPreview.items[1].totalMarketCents, 1350);
+  assert.equal(allPreview.totalCopies, 4);
+  assert.equal(allPreview.totalMarketCents, 4150);
+  assert.equal(allPreview.scopedEligibleCount, 3); // m1, m2, y1 (m3 overridden by list 2, m4 manual, p1 product)
+
+  // Preview a list-specific limit when a broader All-cards limit is active.
+  const list2Preview = previewLimitLeftOut(
+    results,
+    [{ type: 'all', cents: 300 }],
+    [],
+    { type: 'list', game: 'Magic', listId: '2' },
+    500,
+  );
+  assert.deepEqual(list2Preview.items.map(i => i.key), ['m3']);
+  assert.equal(list2Preview.items[0].cheapestOfferCents, null);
+  assert.equal(list2Preview.totalCopies, 1);
+  assert.equal(list2Preview.totalMarketCents, 1800);
+
+  // Custom limit higher than every card returns an empty list cleanly.
+  const noneLeftOut = previewLimitLeftOut(results, [], [], { type: 'all' }, 5000);
+  assert.equal(noneLeftOut.items.length, 0);
+  assert.equal(noneLeftOut.totalCopies, 0);
+  assert.equal(noneLeftOut.totalMarketCents, 0);
 });
 
 test('parseProductOfferRow extracts price, per-seller shipping, location, and optional condition', () => {

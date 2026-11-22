@@ -456,6 +456,26 @@
     </div>
   </div>
 
+  <!-- Price Limit Left-Out Cards Modal -->
+  <div id="limitInfoModal" class="modal-backdrop" hidden>
+    <div class="modal-card limit-info-modal-card" role="dialog" aria-modal="true" aria-labelledby="limitInfoModalTitle">
+      <div class="export-modal-head">
+        <div>
+          <h3 id="limitInfoModalTitle">Cards left out</h3>
+          <p id="limitInfoModalSub" class="export-modal-sub"></p>
+        </div>
+        <button type="button" id="limitInfoModalCloseX" class="btn btn-ghost btn-xs" aria-label="Close">✕</button>
+      </div>
+      <div id="limitInfoModalBody" class="limit-info-body"></div>
+      <div class="export-footer">
+        <div class="export-footer-left">
+          <button type="button" id="limitInfoSelect" class="btn btn-secondary btn-sm" hidden>Select limit</button>
+        </div>
+        <button type="button" id="limitInfoModalClose" class="btn btn-ghost btn-sm">Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Toast notifications -->
   <div id="toastHost" class="toast-host"></div>
 

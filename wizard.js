@@ -151,6 +151,61 @@
     return { kept, leftOut, countsByScope };
   }
 
+  function previewLimitLeftOut(results, activeLimits = [], manualCuts = [], scope = { type: 'all' }, cents) {
+    if (!Array.isArray(results) || !Number.isFinite(cents) || cents <= 0) {
+      return { items: [], totalCopies: 0, totalMarketCents: 0, scopedEligibleCount: 0 };
+    }
+    const targetScopeKey = scopeKey(scope);
+    const baseRules = (activeLimits || []).filter(r => scopeKey(r) !== targetScopeKey);
+    const candidateRule = { ...scope, cents };
+    const trialRules = [...baseRules, candidateRule];
+    const manual = new Set(manualCuts || []);
+
+    let scopedEligibleCount = 0;
+    for (const result of results) {
+      if (result.kind === 'product' || manual.has(result.key)) continue;
+      const winner = effectiveLimitRule(result, trialRules);
+      if (winner && scopeKey(winner) === targetScopeKey) scopedEligibleCount += 1;
+    }
+
+    const { leftOut } = filterByLimits(results, trialRules, manualCuts);
+    const items = leftOut
+      .filter(r => r.cutReason === 'limit' && r.cutRule && scopeKey(r.cutRule) === targetScopeKey)
+      .map(r => {
+        const amount = r.amount || 1;
+        const targetCents = r.targetCents;
+        const totalMarketCents = Number.isFinite(targetCents) ? targetCents * amount : null;
+        let cheapestOfferCents = null;
+        if (Array.isArray(r.offers) && r.offers.length) {
+          for (const offer of r.offers) {
+            if (Number.isFinite(offer?.priceCents) && (cheapestOfferCents === null || offer.priceCents < cheapestOfferCents)) {
+              cheapestOfferCents = offer.priceCents;
+            }
+          }
+        }
+        return {
+          key: r.key,
+          name: r.name,
+          game: r.game || 'Magic',
+          listId: r.listId ?? null,
+          listName: r.listName ?? null,
+          amount,
+          targetCents,
+          totalMarketCents,
+          cheapestOfferCents,
+        };
+      })
+      .sort((a, b) =>
+        (b.targetCents ?? -1) - (a.targetCents ?? -1) ||
+        (b.totalMarketCents ?? -1) - (a.totalMarketCents ?? -1) ||
+        String(a.name || '').localeCompare(String(b.name || ''))
+      );
+
+    const totalCopies = items.reduce((sum, item) => sum + item.amount, 0);
+    const totalMarketCents = items.reduce((sum, item) => sum + (item.totalMarketCents ?? 0), 0);
+    return { items, totalCopies, totalMarketCents, scopedEligibleCount };
+  }
+
   // One unit is one wanted copy; a card wanted twice is two units.
   function unitsOf(collection) {
     const units = [];
@@ -979,7 +1034,7 @@
 
   root.CardmarketWizard = {
     createPlanner, parseShippingTable, shipping, shippingByWeight, parcelShipping, weightOf,
-    scopeKey, matchesScope, effectiveLimitRule, filterByLimits, summarizeBasketBySource,
+    scopeKey, matchesScope, effectiveLimitRule, filterByLimits, previewLimitLeftOut, summarizeBasketBySource,
     basketItemSignature, applyBasketRemovals, STRATEGIES,
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);
