@@ -3,6 +3,13 @@
 (() => {
   'use strict';
 
+  const readCsrfToken = () => {
+    for (const el of document.querySelectorAll('[name="__cmtkn"]')) {
+      if (el.value) return el.value;
+    }
+    return null;
+  };
+
   chrome.runtime.onMessage.addListener((message, sender, reply) => {
     if (!message || typeof message !== 'object') return false;
     if (sender?.id !== chrome.runtime.id) return false;
@@ -11,13 +18,13 @@
       reply({
         ok: true,
         url: location.href,
-        hasToken: Boolean(document.querySelector('[name="__cmtkn"]')?.value),
+        hasToken: Boolean(readCsrfToken()),
       });
       return false;
     }
 
     if (message.type === 'cm-token') {
-      reply({ token: document.querySelector('[name="__cmtkn"]')?.value || null });
+      reply({ token: readCsrfToken() });
       return false;
     }
 

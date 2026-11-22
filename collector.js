@@ -35,6 +35,15 @@
   // Cardmarket or Cloudflare said no outright (HTTP 403, "Access denied", a block page): there is
   // no check to complete, so it is neither retried nor a reason to pause.
   class RefusedError extends Error {}
+  // Cardmarket returned a deterministic XML rejection for a cart POST (e.g. article sold out or
+  // insufficient stock), distinct from rate limits, refusals, network errors, or HTML responses.
+  class CartRejectError extends Error {
+    constructor(message, { code = null, detail = "" } = {}) {
+      super(message);
+      this.code = code;
+      this.detail = detail;
+    }
+  }
 
   function cents(text) {
     const match = /(\d[\d.]*),(\d{2})/.exec(text || '');
@@ -204,6 +213,15 @@
     return new TextDecoder().decode(bytes);
   }
 
+  function safeDecodeBase64(text) {
+    if (!text) return null;
+    try {
+      return decodeBase64(text);
+    } catch {
+      return String(text).trim() || null;
+    }
+  }
+
   const WANTS_ACTION_OR_GENERIC = /^(view(\s*\/\s*edit)?(\s+list)?|edit(\s+list)?|delete|remove|shopping wizard|wizard|open|show|details?|(my\s+)?wants(\s+lists?)?|edit\s+wants(\s+list)?)$/i;
 
   function cleanHeadingText(el) {
@@ -369,6 +387,7 @@
     const baseFor = g => `${baseOrigin}/en/${g || game}`;
     const resolveUrl = path => (path.startsWith('http') ? path : `${baseOrigin}${path}`);
     const originRef = baseOrigin || (typeof location !== 'undefined' ? location.href : 'https://www.cardmarket.com');
+    let cachedToken = null;
 
     async function request(url, init) {
       const started = Date.now();
@@ -398,8 +417,9 @@
         error.accessDenied = /attention required|access denied/i.test(title);
         const header = response.headers.get('retry-after');
         const seconds = Number(header);
-        if (response.status === 429 && seconds > 0) error.retryAfterMs = Math.min(seconds, 1800) * 1000;
-        error.readRetryAfterMs = /^\d+$/.test(header || '') ? seconds * 1000 : Math.max(0, Date.parse(header) - Date.now()) || 0;
+        const parsedMs = /^\d+$/.test(header || '') ? seconds * 1000 : Math.max(0, Date.parse(header) - Date.now()) || 0;
+        if (response.status === 429 && parsedMs > 0) error.retryAfterMs = Math.min(parsedMs, 1800 * 1000);
+        error.readRetryAfterMs = parsedMs;
         throw error;
       }
       if (/\/(login|signup)\b/i.test(new URL(response.url, originRef).pathname)) {
@@ -409,7 +429,30 @@
       return { text, url: response.url };
     }
 
-    async function resolveToken(gameOverride) {
+    function extractTokenFromHtml(html) {
+      const match = /name=["']__cmtkn["'][^>]*value=["']([^"']+)["']/i.exec(html)
+        || /value=["']([^"']+)["'][^>]*name=["']__cmtkn["']/i.exec(html);
+      return match ? match[1] : null;
+    }
+
+    async function fetchFreshToken(gameOverride) {
+      for (const pagePath of ['ShoppingCart', 'Wants']) {
+        const { text } = await request(`${baseFor(gameOverride)}/${pagePath}`);
+        const found = extractTokenFromHtml(text);
+        if (found) {
+          cachedToken = found;
+          return found;
+        }
+      }
+      throw new Error('No Cardmarket session token on this page');
+    }
+
+    async function resolveToken(gameOverride, { forceFresh = false } = {}) {
+      if (forceFresh) {
+        cachedToken = null;
+        return fetchFreshToken(gameOverride);
+      }
+      if (cachedToken) return cachedToken;
       if (getToken) {
         const t = await getToken(gameOverride || game);
         if (t) return t;
@@ -418,15 +461,11 @@
         const local = document.querySelector('[name="__cmtkn"]')?.value;
         if (local) return local;
       }
-      // Fallback: read token from ShoppingCart page.
-      const { text } = await request(`${baseFor(gameOverride)}/ShoppingCart`);
-      const match = /name="__cmtkn"[^>]*value="([^"]+)"/i.exec(text) || /value="([^"]+)"[^>]*name="__cmtkn"/i.exec(text);
-      if (match) return match[1];
-      throw new Error('No Cardmarket session token on this page');
+      return fetchFreshToken(gameOverride);
     }
 
-    async function cartRequest(action, items, gameOverride) {
-      const token = await resolveToken(gameOverride);
+    async function cartRequest(action, items, gameOverride, retriedToken = false) {
+      const token = await resolveToken(gameOverride, { forceFresh: retriedToken });
       const body = new FormData();
       body.append('__cmtkn', token);
       for (const { idArticle, amount } of items) {
@@ -436,11 +475,18 @@
       const { text } = await request(`${baseFor(gameOverride)}/AjaxAction/${action}`, { method: 'POST', body });
       const xml = new DOMParser().parseFromString(text, 'text/xml');
       const value = name => xml.getElementsByTagName(name)[0]?.textContent;
-      const code = value('resultsCode') ? decodeBase64(value('resultsCode')) : null;
-      if (code !== 'generalOK') {
-        const said = value('resultsMessage') ? decodeBase64(value('resultsMessage')) : text;
-        throw new Error(`Cardmarket answered ${code ?? 'without a result code'}: ${said.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)}`);
+      const code = safeDecodeBase64(value('resultsCode'));
+      if (code === 'generalOK') return;
+      const said = safeDecodeBase64(value('resultsMessage')) || text;
+      const clean = said.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+      if (code !== null) {
+        if (!retriedToken && /token|csrf|__cmtkn|session/i.test(`${code} ${clean}`)) {
+          return cartRequest(action, items, gameOverride, true);
+        }
+        throw new CartRejectError(`Cardmarket answered ${code}: ${clean}`, { code, detail: clean });
       }
+      cachedToken = null;
+      throw new Error(`Cardmarket answered without a result code: ${clean}`);
     }
 
     // Card-page rows; unreadable ones are skipped and counted rather than failing the card.
@@ -597,6 +643,11 @@
         return parseUserOffersPage(page, seller, pageNumber, originRef, { requireAttributes: false, allowEmpty: true });
       },
 
+      async refreshToken(gameOverride) {
+        cachedToken = null;
+        return fetchFreshToken(gameOverride);
+      },
+
       async addToCart(idArticle, amount, gameOverride) {
         await cartRequest('ShoppingCart_Add_AddArticlesFromProductPage', [{ idArticle, amount }], gameOverride);
       },
@@ -658,19 +709,21 @@
     });
   }
 
-  function pacer(intervalMs, bucketIntervals = {}) {
+  function pacer(intervalMs, bucketIntervals = {}, signal = null) {
     let nextAt = 0;
     const holds = new Map();
     const bucketNext = new Map();
     return {
       intervalMs, holds,
       async wait(bucket) {
-        for (let until = holds.get(bucket) || 0; until > Date.now(); until = holds.get(bucket) || 0) await sleep(until - Date.now());
+        for (let until = holds.get(bucket) || 0; until > Date.now(); until = holds.get(bucket) || 0) {
+          await sleepUntil(until, signal);
+        }
         const now = Date.now();
         const at = Math.max(now, nextAt, bucketNext.get(bucket) || 0);
         nextAt = at + this.intervalMs;
         if (bucketIntervals[bucket]) bucketNext.set(bucket, at + bucketIntervals[bucket]);
-        if (at > now) await sleep(at - now);
+        if (at > now) await sleepUntil(at, signal);
       },
     };
   }
@@ -684,12 +737,12 @@
   function createRunner(site, options) {
     const {
       concurrency = 2, intervalMs = 1000, bucketIntervals = { cart: 2000 }, maxRetries = 4, maxWaits = 6, retryDelayMs = 2000,
-      maxPausesWithoutSuccess = 10,
+      maxPausesWithoutSuccess = 10, maxWaitMs = null,
       signal = null, waitForUser = null, log = () => {}, onWait = () => {}, onDeferred = async () => {},
       readRetryDelays = null, readRetryBudgetMs = 180000,
     } = options;
     const run = limiter(concurrency);
-    const pace = pacer(intervalMs, bucketIntervals);
+    const pace = pacer(intervalMs, bucketIntervals, signal);
     const stats = { requests: 0, retries: 0, waits: 0, pauses: 0, cachedQueries: 0, startedAt: Date.now(), finishedAt: null };
     let blocked = null;
     let pause = null;
@@ -777,7 +830,7 @@
             if (refusals >= 3 && !blocked) blocked = new StoppedError(`${error.message} Stopped after ${refusals} refusals in a row; try again later.`);
             throw error;
           }
-          if (error instanceof BlockedError && !(error instanceof StoppedError) && waitForUser && !blocked) {
+          if (error instanceof BlockedError && !(error instanceof StoppedError) && !error.login && waitForUser && !blocked) {
             if (!pause && pausesWithoutSuccess >= maxPausesWithoutSuccess) {
               blocked = new StoppedError(`Cardmarket still refused after ${pausesWithoutSuccess} waits in a row. Stopped; try again later.`);
               throw blocked;
@@ -798,6 +851,12 @@
           // A 5xx on a cart POST may already have added the items; only rate limits are safe to retry.
           if (bucket === 'cart' && error.cause !== 'rate') throw error;
           if (error.retryAfterMs && waits < maxWaits) {
+            if (maxWaitMs != null && error.retryAfterMs > maxWaitMs) {
+              const until = Date.now() + error.retryAfterMs;
+              const mins = Math.max(1, Math.ceil(error.retryAfterMs / 60000));
+              blocked = new BlockedError(`Cardmarket rate-limited this action until ${new Date(until).toLocaleTimeString()} (~${mins} min). Try again later.`);
+              throw blocked;
+            }
             waits += 1;
             stats.waits += 1;
             const until = Math.max(pace.holds.get(bucket) || 0, Date.now() + error.retryAfterMs);
@@ -813,7 +872,7 @@
           stats.retries += 1;
           if (error.cause === 'rate') pace.intervalMs = Math.min(pace.intervalMs * 2, 10000);
           log({ type: 'retry', method, error: error.message, attempt, intervalMs: pace.intervalMs });
-          await sleep(retryDelayMs * 2 ** attempt);
+          await sleepUntil(Date.now() + retryDelayMs * 2 ** attempt, signal);
         }
       }
     }
@@ -1704,7 +1763,7 @@
   }
 
   root.CardmarketCollector = {
-    collect, collectBySellers, collectSellerTokens, createRunner, expansionGroups, browserSite, RefusedError,
+    collect, collectBySellers, collectSellerTokens, createRunner, expansionGroups, browserSite, RefusedError, CartRejectError,
     parseUserOffersPage,
     parseWantsList, parseWantsListName, parseWantsOverview, parseProductPageMeta, parseOfferRow, parseProductOfferRow,
     cents, allCents, RetryableError, BlockedError, StoppedError, LANGUAGES, CONDITIONS, CACHE_MAX_AGE_MS,

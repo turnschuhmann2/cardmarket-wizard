@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 require('../collector.js');
-const { browserSite, createRunner, BlockedError, RefusedError, RetryableError } = globalThis.CardmarketCollector;
+const { browserSite, createRunner, BlockedError, StoppedError, RefusedError, RetryableError, CartRejectError } = globalThis.CardmarketCollector;
 
 globalThis.location = { href: 'https://www.cardmarket.com/en/Magic/Wants/1' };
 const reply = (status, title, headers = {}) => async () => ({
@@ -100,4 +100,121 @@ test('long Retry-After defers the run; Stop cancels a shorter wait', async () =>
   });
   await assert.rejects(stopped.call('cardPage'), /Stopped/);
   assert.equal(stopped.stats.requests, 1);
+});
+
+test('cart call stops immediately when Retry-After exceeds maxWaitMs', async () => {
+  let calls = 0;
+  const runner = createRunner({
+    async addSellerToCart() {
+      calls += 1;
+      throw Object.assign(new RetryableError('HTTP 429', { cause: 'rate' }), { retryAfterMs: 541000 });
+    },
+  }, { intervalMs: 0, bucketIntervals: {}, maxWaitMs: 120000 });
+  await assert.rejects(runner.call('addSellerToCart', [], 'Magic'), err => err instanceof BlockedError && /rate-limited/i.test(err.message));
+  assert.equal(calls, 1);
+});
+
+test('cart call aborts promptly when Stop is clicked during a Retry-After wait', async () => {
+  const controller = new AbortController();
+  const started = Date.now();
+  const runner = createRunner({
+    async addSellerToCart() {
+      throw Object.assign(new RetryableError('HTTP 429', { cause: 'rate' }), { retryAfterMs: 60000 });
+    },
+  }, {
+    intervalMs: 0,
+    bucketIntervals: {},
+    maxWaitMs: 120000,
+    signal: controller.signal,
+    onWait: () => setTimeout(() => controller.abort(), 15),
+  });
+  await assert.rejects(runner.call('addSellerToCart', [], 'Magic'), StoppedError);
+  assert.ok(Date.now() - started < 2000, 'abort should not wait for full Retry-After');
+});
+
+test('cart call stops immediately on login redirect without prompting or auto-retrying', async () => {
+  let calls = 0;
+  const runner = createRunner({
+    async addSellerToCart() {
+      calls += 1;
+      throw Object.assign(new BlockedError('Cardmarket asked for a login.'), { login: true });
+    },
+  }, { intervalMs: 0, bucketIntervals: {}, waitForUser: () => assert.fail('unexpected waitForUser on login') });
+  await assert.rejects(runner.call('addSellerToCart', [], 'Magic'), err => err instanceof BlockedError && err.login);
+  assert.equal(calls, 1);
+});
+
+test('browserSite cartRequest classifies XML rejections vs HTML errors and refreshes stale tokens', async () => {
+  const prevDOMParser = globalThis.DOMParser;
+  globalThis.DOMParser = class FakeDOMParser {
+    parseFromString(text) {
+      return {
+        getElementsByTagName(tag) {
+          const m = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text);
+          return m ? [{ textContent: m[1] }] : [];
+        },
+      };
+    }
+  };
+  const b64 = s => Buffer.from(s, 'utf8').toString('base64');
+  const okReply = (url, body) => ({ status: 200, ok: true, redirected: false, url, headers: new Headers(), text: async () => body });
+
+  try {
+    // 1. refreshToken falls back from empty ShoppingCart to Wants and overrides stale DOM token
+    const seenTokens = [];
+    const urls = [];
+    const site1 = browserSite({
+      getToken: async () => 'STALE_DOM_TOKEN',
+      fetchImpl: async (url, init) => {
+        urls.push(url);
+        if (url.endsWith('/ShoppingCart')) return okReply(url, '<html><body>Empty cart</body></html>');
+        if (url.endsWith('/Wants')) return okReply(url, '<html><input name="__cmtkn" value="FRESH_WANTS_TOKEN"></html>');
+        seenTokens.push(init.body.get('__cmtkn'));
+        return okReply(url, `<response><resultsCode>${b64('generalOK')}</resultsCode></response>`);
+      },
+    });
+    const refreshed = await site1.refreshToken('Magic');
+    assert.equal(refreshed, 'FRESH_WANTS_TOKEN');
+    await site1.addSellerToCart([{ idArticle: 42, amount: 1 }], 'Magic');
+    assert.deepEqual(seenTokens, ['FRESH_WANTS_TOKEN']);
+
+    // 2. Deterministic XML business error throws CartRejectError; HTML error throws plain Error
+    const site2 = browserSite({
+      getToken: async () => 'TOK',
+      fetchImpl: async url => okReply(url, `<response><resultsCode>${b64('generalError')}</resultsCode><resultsMessage>${b64('Article no longer available')}</resultsMessage></response>`),
+    });
+    await assert.rejects(
+      site2.addSellerToCart([{ idArticle: 1, amount: 1 }], 'Magic'),
+      err => err instanceof CartRejectError && err.code === 'generalError' && /no longer available/i.test(err.message),
+    );
+
+    const site3 = browserSite({
+      getToken: async () => 'TOK',
+      fetchImpl: async url => okReply(url, '<html><body>Unexpected HTML page</body></html>'),
+    });
+    await assert.rejects(
+      site3.addSellerToCart([{ idArticle: 1, amount: 1 }], 'Magic'),
+      err => !(err instanceof CartRejectError) && /without a result code/i.test(err.message),
+    );
+
+    // 3. Explicit XML token rejection refreshes token once and retries
+    let postCount = 0;
+    const postedTokens = [];
+    const site4 = browserSite({
+      getToken: async () => 'OLD_TOK',
+      fetchImpl: async (url, init) => {
+        if (url.endsWith('/ShoppingCart')) return okReply(url, '<input name="__cmtkn" value="NEW_TOK">');
+        postCount += 1;
+        postedTokens.push(init.body.get('__cmtkn'));
+        if (postCount === 1) {
+          return okReply(url, `<response><resultsCode>${b64('generalError')}</resultsCode><resultsMessage>${b64('Invalid CSRF token')}</resultsMessage></response>`);
+        }
+        return okReply(url, `<response><resultsCode>${b64('generalOK')}</resultsCode></response>`);
+      },
+    });
+    await site4.addSellerToCart([{ idArticle: 7, amount: 2 }], 'Magic');
+    assert.deepEqual(postedTokens, ['OLD_TOK', 'NEW_TOK']);
+  } finally {
+    globalThis.DOMParser = prevDOMParser;
+  }
 });

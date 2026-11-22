@@ -5,7 +5,7 @@
   'use strict';
 
   const {
-    collect, collectBySellers, collectSellerTokens, createRunner, browserSite, BlockedError, RetryableError, RefusedError, CACHE_MAX_AGE_MS,
+    collect, collectBySellers, collectSellerTokens, createRunner, browserSite, BlockedError, RetryableError, RefusedError, CartRejectError, CACHE_MAX_AGE_MS,
   } = globalThis.CardmarketCollector;
   const {
     parseShippingTable, parcelShipping, scopeKey, filterByLimits, previewLimitLeftOut, matchesScope, summarizeBasketBySource,
@@ -253,6 +253,20 @@
     return `${listsPart}|${prodsPart}|${regionPart}`;
   }
 
+  // Signatures written before the EU shipping-aware cache format (eu -> eu2:<shipTo>, custom -> ...:d<shipTo>).
+  function legacySelectionSignatures() {
+    const listsPart = getSelectedListObjects().map(l => `${l.game}:${l.listId}`).sort().join(',');
+    const prodsPart = getEnabledProducts().map(p => `${p.productPath}x${p.amount || 1}`).sort().join(',');
+    const countries = getSellerCountries();
+    const sigs = [];
+    if (state.regionMode === 'eu') {
+      sigs.push(`${listsPart}|${prodsPart}|eu`);
+    } else if (countries.length > 1 && countries.includes(state.shipTo)) {
+      sigs.push(`${listsPart}|${prodsPart}|${countries.join('.')}`);
+    }
+    return sigs;
+  }
+
   function collectionKeyFor(sig) { return `bwCol:${sig}`; }
   function limitsKeyFor(sig) { return `bwLimits:${sig}`; }
   function cutsKeyFor(sig) { return `bwCuts:${sig}`; }
@@ -305,6 +319,22 @@
       col = stored[collectionKeyFor(sig)] || null;
     }
     if (!col || !Array.isArray(col.results) || !col.stats?.finishedAt) {
+      const legacySigs = legacySelectionSignatures();
+      if (legacySigs.length) {
+        let legacyCol = legacySigs.includes(state.collection?.selectionSig) ? state.collection : null;
+        if (!legacyCol) {
+          const keys = legacySigs.map(collectionKeyFor);
+          const stored = await chrome.storage.local.get(keys);
+          for (const key of keys) {
+            if (stored[key]) { legacyCol = stored[key]; break; }
+          }
+        }
+        if (legacyCol && Array.isArray(legacyCol.results) && legacyCol.stats?.finishedAt) {
+          const ageMs = Date.now() - legacyCol.stats.finishedAt;
+          const incomplete = Boolean(legacyCol.blocked) || legacyCol.results.some(r => r.verdict === 'blocked');
+          return { status: 'legacy', sig, legacySig: legacyCol.selectionSig || legacySigs[0], collection: legacyCol, ageMs, incomplete };
+        }
+      }
       return { status: 'missing', sig, collection: null };
     }
     const ageMs = Date.now() - col.stats.finishedAt;
@@ -319,6 +349,21 @@
     const text = $('cachePillText');
     const info = await inspectSelectionCache();
     pill.className = 'cache-pill';
+    pill.title = 'Offer cache status for your current selection';
+    if (info.status === 'legacy') {
+      pill.classList.add('cache-stale');
+      const suffix = info.ageMs >= CACHE_MAX_AGE_MS ? ' · >8h' : ' · older EU format';
+      text.textContent = `Legacy cache · ${fmtAge(info.collection.stats.finishedAt)}${suffix}`;
+      pill.title = 'Cached before the EU shipping-aware update. Click Compute Basket to refetch or reuse the old cache.';
+      return info;
+    }
+    if ((info.status === 'missing' || info.status === 'empty') && state.collection?.stats?.finishedAt) {
+      const count = Array.isArray(state.collection.results) ? state.collection.results.length : 0;
+      pill.classList.add('cache-stale');
+      text.textContent = `Loaded run · ${fmtAge(state.collection.stats.finishedAt)} · ${count} items (selection differs)`;
+      pill.title = 'Showing a loaded basket from an earlier run or different sidebar selection; no cache exists yet for the current selection.';
+      return info;
+    }
     if (info.status === 'empty') {
       pill.classList.add('cache-none');
       text.textContent = 'Select lists or products';
@@ -2071,15 +2116,23 @@
       return;
     }
 
-    // Cache is missing, incomplete, or >8 hours old -> show clear confirmation modal!
-    const reasonText = info.status === 'stale'
-      ? `Your cached offers for this selection are ${fmtAge(info.collection.stats.finishedAt)} (older than 8 hours). Computing will refetch all selected cards and products from Cardmarket so prices and stock are up to date.`
-      : info.status === 'incomplete'
-        ? `Your cached fetch for this selection stopped early (${fmtAge(info.collection.stats.finishedAt)}). Computing will refetch the remaining cards and products from Cardmarket.`
-        : 'No offer cache exists yet for the selected lists, products, and seller region. Computing will fetch all selected cards and products from Cardmarket first.';
+    // Cache is missing, legacy, incomplete, or >8 hours old -> show clear confirmation modal!
+    const reasonText = info.status === 'legacy'
+      ? `Your cached offers from ${fmtAge(info.collection.stats.finishedAt)} were fetched before the EU shipping-aware update${info.ageMs >= CACHE_MAX_AGE_MS ? ' (and are older than 8 hours)' : ''}. Refetching updates EU & domestic results, or you can compute from the old cache.`
+      : info.status === 'stale'
+        ? `Your cached offers for this selection are ${fmtAge(info.collection.stats.finishedAt)} (older than 8 hours). Computing will refetch all selected cards and products from Cardmarket so prices and stock are up to date.`
+        : info.status === 'incomplete'
+          ? `Your cached fetch for this selection stopped early (${fmtAge(info.collection.stats.finishedAt)}). Computing will refetch the remaining cards and products from Cardmarket.`
+          : 'No offer cache exists yet for the selected lists, products, and seller region. Computing will fetch all selected cards and products from Cardmarket first.';
+
+    const modalTitle = info.status === 'legacy'
+      ? 'Offer cache uses the older EU format'
+      : info.status === 'stale'
+        ? 'Offer cache is older than 8 hours'
+        : 'Offer cache needs to be fetched';
 
     const choice = await askCacheModal({
-      title: info.status === 'stale' ? 'Offer cache is older than 8 hours' : 'Offer cache needs to be fetched',
+      title: modalTitle,
       body: reasonText,
       allowOld: Boolean(info.collection),
     });
@@ -2087,11 +2140,12 @@
     if (choice === 'cancel') return;
     if (choice === 'old' && info.collection) {
       state.collection = info.collection;
-      await loadLimitsAndCutsFor(info.sig);
+      await loadLimitsAndCutsFor(info.legacySig || info.sig);
+      await updateCachePill();
       await computeBasketFromCollection();
       return;
     }
-    await fetchAndCompute({ forceFresh: info.status === 'stale' });
+    await fetchAndCompute({ forceFresh: info.status === 'stale' || (info.status === 'legacy' && info.ageMs >= CACHE_MAX_AGE_MS) });
   }
 
   // ---- Add Wants List by URL (resolves real list title & count from Cardmarket) ----
@@ -2454,9 +2508,9 @@
     $('trackedSellers').value = Object.keys(map).sort().join(', ');
   }
 
-  async function checkCart(existingRunner = null) {
+  async function checkCart(existingRunner = null, { prefixHtml = '' } = {}) {
     const out = $('cartCheckBox');
-    out.innerHTML = '<div class="alert-banner alert-info" style="margin-bottom:12px"><span>Reading your Cardmarket shopping cart…</span></div>';
+    out.innerHTML = `${prefixHtml}<div class="alert-banner alert-info" style="margin-bottom:12px"><span>Reading your Cardmarket shopping cart…</span></div>`;
     try {
       const runner = existingRunner || createRunner(site, { intervalMs: state.interval, log: record });
       const shipments = await runner.call('cartShipping');
@@ -2470,7 +2524,7 @@
       const predicted = new Map((activeBasket()?.parcels || []).map(p => [p.seller, p]));
       const diffs = shipments.filter(s => predicted.has(s.seller) && s.shippingCents !== predicted.get(s.seller).shippingCents);
       const sum = k => shipments.reduce((t, s) => t + (s[k] || 0), 0);
-      out.innerHTML = `<div class="alert-banner alert-info" style="margin-bottom:12px">
+      out.innerHTML = `${prefixHtml}<div class="alert-banner alert-info" style="margin-bottom:12px">
         <div>
           <strong>Cart: ${shipments.length} sellers · articles ${euros(sum('itemsCents'))} · shipping ${euros(sum('shippingCents'))}${sum('trusteeCents') ? ` · trustee ${euros(sum('trusteeCents'))}` : ''}</strong><br>
           ${diffs.length
@@ -2482,7 +2536,7 @@
       </div>`;
       $('btnRebuildTracked')?.addEventListener('click', () => { if (!workInProgress()) computeBasketFromCollection(); });
     } catch (error) {
-      out.innerHTML = `<div class="alert-banner alert-warn" style="margin-bottom:12px">Could not read cart: ${esc(error.message)}</div>`;
+      out.innerHTML = `${prefixHtml}<div class="alert-banner alert-warn" style="margin-bottom:12px">Could not read cart: ${esc(error.message)}</div>`;
     }
   }
 
@@ -2512,15 +2566,45 @@
     const controller = new AbortController();
     state.controller = controller;
     syncBusyUI();
-    const runner = createRunner(site, { intervalMs: state.interval, signal: controller.signal, waitForUser, log: record });
     const failed = [];
     let done = 0;
+    const runner = createRunner(site, {
+      intervalMs: state.interval,
+      signal: controller.signal,
+      waitForUser,
+      log: record,
+      maxWaits: 2,
+      maxRetries: 2,
+      maxWaitMs: 120000,
+      onWait: ({ until }) => {
+        showProgress(
+          'Waiting for Cardmarket rate limit…',
+          `Retrying at ${new Date(until).toLocaleTimeString()} · ${done}/${totalItems} items`,
+          Math.round((done / totalItems) * 100),
+          'You can click Stop to cancel.',
+        );
+      },
+    });
     const mark = async items => {
       for (const item of items) added[item.idArticle] = Date.now();
       done += items.reduce((s, i) => s + i.amount, 0);
       await chrome.storage.local.set({ [cartKey]: added });
     };
+    const renderFailedBanner = () => (failed.length
+      ? `<div class="alert-banner alert-warn" style="margin-bottom:12px"><div><strong>Could not add:</strong> ${failed.map(esc).join('; ')}</div></div>`
+      : '');
     try {
+      // Refresh the CSRF token once from Cardmarket so an hours-old tab DOM token does not break checkout.
+      const firstGame = orders[0]?.items[0]?.game || 'Magic';
+      showProgress('Refreshing Cardmarket session…', `0/${totalItems} items`, 2);
+      try {
+        await runner.call('refreshToken', firstGame);
+      } catch (tokenErr) {
+        if (tokenErr instanceof BlockedError || runner.blocked()) throw runner.blocked() || tokenErr;
+        record({ type: 'token-refresh-fallback', message: tokenErr.message });
+      }
+
+      let consecutiveUnexpected = 0;
       for (const [idx, order] of orders.entries()) {
         showProgress(`Adding to Cardmarket cart (${idx + 1}/${orders.length})…`, `${order.seller} · ${done}/${totalItems} items`, Math.round((done / totalItems) * 100));
         // Group by game when adding per seller so each game endpoint gets its own articles cleanly.
@@ -2533,20 +2617,44 @@
           try {
             await runner.call('addSellerToCart', groupItems, g);
             await mark(groupItems);
+            consecutiveUnexpected = 0;
           } catch (error) {
-            if (error instanceof BlockedError) throw error;
+            if (error instanceof BlockedError || runner.blocked()) throw runner.blocked() || error;
+            if (error instanceof RetryableError && error.cause === 'rate') {
+              throw new BlockedError(`Cardmarket rate-limited cart adds (${error.message}). Try again in a few minutes.`);
+            }
             if (error instanceof RetryableError || error instanceof RefusedError || error instanceof TypeError) {
               // The outcome is unknown and the items may already be in the cart: retrying per item could duplicate them.
               failed.push(`${groupItems.map(item => item.name).join(', ')} (${order.seller}): ${error.message}. Check your Cardmarket cart before retrying`);
               continue;
             }
-            for (const item of groupItems) {
+            if (!(error instanceof CartRejectError)) {
+              // Non-XML / session / bridge / HTTP 4xx failure: do not storm per-item cart endpoints.
+              failed.push(`${groupItems.map(item => item.name).join(', ')} (${order.seller}): ${error.message}`);
+              consecutiveUnexpected += 1;
+              if (done === 0 && consecutiveUnexpected >= 3) {
+                throw new BlockedError(`Stopped after ${consecutiveUnexpected} consecutive cart errors: ${error.message}`);
+              }
+              continue;
+            }
+            consecutiveUnexpected = 0;
+            for (const [itemIdx, item] of groupItems.entries()) {
+              showProgress(
+                `Adding to Cardmarket cart (${idx + 1}/${orders.length})…`,
+                `${order.seller} · item ${itemIdx + 1}/${groupItems.length} · ${done}/${totalItems} items`,
+                Math.round((done / totalItems) * 100),
+                'Bulk add rejected; adding available items individually',
+              );
               try {
                 await runner.call('addToCart', item.idArticle, item.amount, g);
                 await mark([item]);
               } catch (itemErr) {
-                if (itemErr instanceof BlockedError) throw itemErr;
+                if (itemErr instanceof BlockedError || runner.blocked()) throw runner.blocked() || itemErr;
+                if (itemErr instanceof RetryableError && itemErr.cause === 'rate') {
+                  throw new BlockedError(`Cardmarket rate-limited cart adds (${itemErr.message}). Try again in a few minutes.`);
+                }
                 failed.push(`${item.name} (${order.seller}): ${itemErr.message}`);
+                if (itemErr instanceof RefusedError) break;
               }
             }
           }
@@ -2554,13 +2662,17 @@
       }
       hideProgress();
       toast(`Added ${done}/${totalItems} items to your Cardmarket cart.` + (failed.length ? ` ${failed.length} failed.` : ''), failed.length ? 'error' : 'success');
-      if (failed.length) {
-        $('cartCheckBox').innerHTML = `<div class="alert-banner alert-warn" style="margin-bottom:12px"><div><strong>Could not add:</strong> ${failed.map(esc).join('; ')}</div></div>`;
+      const failedHtml = renderFailedBanner();
+      if (done > 0) {
+        await checkCart(runner, { prefixHtml: failedHtml });
+      } else if (failedHtml) {
+        $('cartCheckBox').innerHTML = failedHtml;
       }
-      await checkCart(runner);
     } catch (error) {
       hideProgress();
       toast(`Stopped after ${done}/${totalItems}: ${error.message}`, 'error');
+      const stopHtml = `<div class="alert-banner alert-warn" style="margin-bottom:12px"><div><strong>Cart add stopped (${done}/${totalItems} added):</strong> ${esc(error.message)}</div></div>`;
+      $('cartCheckBox').innerHTML = stopHtml + renderFailedBanner();
     } finally {
       if (state.controller === controller) state.controller = null;
       state.carting = false;
