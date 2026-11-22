@@ -218,3 +218,86 @@ test('browserSite cartRequest classifies XML rejections vs HTML errors and refre
     globalThis.DOMParser = prevDOMParser;
   }
 });
+
+test('read path adaptively slows down on rate limits (debounced per wave) and recovers after clean responses', async () => {
+  let cardCalls = 0;
+  const events = [];
+  const runner = createRunner({
+    async cardPage() {
+      cardCalls += 1;
+      if (cardCalls <= 2) throw new RetryableError('HTTP 429', { cause: 'rate' });
+      return 'ok';
+    },
+  }, {
+    concurrency: 2,
+    intervalMs: 20,
+    bucketIntervals: {},
+    jitter: false,
+    recoverEvery: 3,
+    readRetryDelays: [25, 25, 25],
+    log: e => events.push(e),
+  });
+
+  // Two concurrent failures in the same wave should trigger only ONE slowdown.
+  await Promise.all([runner.call('cardPage'), runner.call('cardPage')]);
+  const slowdowns = events.filter(e => e.type === 'pace-slowdown');
+  assert.equal(slowdowns.length, 1, 'same-wave failures debounce to one multiplicative slowdown');
+  const slowedMs = runner.pace.intervalMs;
+  assert.ok(slowedMs > 20, `expected slowed interval > 20, got ${slowedMs}`);
+
+  // Clean streak should recover pacing step-by-step back toward baseIntervalMs.
+  for (let i = 0; i < 6; i += 1) await runner.call('cardPage');
+  assert.ok(runner.pace.intervalMs < slowedMs, `expected recovery below ${slowedMs}, got ${runner.pace.intervalMs}`);
+  assert.ok(events.some(e => e.type === 'pace-recover'));
+});
+
+test('products bucket enforces its own slower floor independently of faster cards pacing', async () => {
+  const prodTimes = [];
+  const cardTimes = [];
+  const runner = createRunner({
+    async productPage() { prodTimes.push(Date.now()); return 'ok'; },
+    async cardPage() { cardTimes.push(Date.now()); return 'ok'; },
+  }, {
+    concurrency: 4,
+    intervalMs: 10,
+    bucketIntervals: { products: 110, cart: 2000 },
+    jitter: false,
+    readRetryDelays: [10],
+  });
+
+  await Promise.all([runner.call('productPage'), runner.call('productPage')]);
+  assert.ok(prodTimes[1] - prodTimes[0] >= 100, `expected product gap >= 100ms, got ${prodTimes[1] - prodTimes[0]}`);
+
+  await Promise.all([runner.call('cardPage'), runner.call('cardPage'), runner.call('cardPage')]);
+  assert.ok(cardTimes[2] - cardTimes[0] < 100, `expected cards not blocked by product floor, got ${cardTimes[2] - cardTimes[0]}ms`);
+});
+
+test('browserSite sellerWants requests sortBy=price_asc by default', async () => {
+  const prevDOMParser = globalThis.DOMParser;
+  globalThis.DOMParser = class FakeDOMParser {
+    parseFromString() {
+      return {
+        querySelector: sel => (sel === '#UserOffersTable' ? {} : null),
+        querySelectorAll: () => [],
+      };
+    }
+  };
+  const urls = [];
+  try {
+    const site = browserSite({
+      fetchImpl: async url => {
+        urls.push(url);
+        return { status: 200, ok: true, redirected: false, url, headers: new Headers(), text: async () => '' };
+      },
+    });
+    await site.sellerWants('BigShop', '12345', 1, 'Magic');
+    await site.sellerWants('BigShop', '12345', 2, 'Magic');
+    assert.match(urls[0], /idWantslist=12345/);
+    assert.match(urls[0], /sortBy=price_asc/);
+    assert.doesNotMatch(urls[0], /site=/);
+    assert.match(urls[1], /sortBy=price_asc/);
+    assert.match(urls[1], /site=2/);
+  } finally {
+    globalThis.DOMParser = prevDOMParser;
+  }
+});

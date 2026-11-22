@@ -6,6 +6,7 @@ const EXPORTS = 'https://downloads.s3.cardmarket.com/productCatalog';
 const CATALOG_MAX_AGE_MS = 20 * 60 * 60 * 1000;
 const SHIPPING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const indexPromises = {};
+let cachedBridgeTabId = null;
 let bridgeTabPromise = null;
 
 // Cardmarket's game ids in the public export file names.
@@ -46,6 +47,10 @@ chrome.action.onClicked.addListener(() => {
   openOrFocusApp();
 });
 
+chrome.tabs.onRemoved.addListener(tabId => {
+  if (tabId === cachedBridgeTabId) cachedBridgeTabId = null;
+});
+
 async function pingTab(tabId) {
   try {
     const res = await chrome.tabs.sendMessage(tabId, { type: 'cm-ping' });
@@ -74,7 +79,7 @@ async function waitForTabComplete(tabId, timeoutMs = 20000) {
   });
 }
 
-async function getCardmarketTab() {
+async function discoverCardmarketTab() {
   const tabs = await chrome.tabs.query({ url: 'https://www.cardmarket.com/*' });
   // Prefer an already-responsive tab (especially one with a CSRF token).
   let fallback = null;
@@ -89,19 +94,50 @@ async function getCardmarketTab() {
   if (fallback != null) return fallback;
 
   // No responsive Cardmarket tab found: open one in the background once.
+  const created = await chrome.tabs.create({ url: 'https://www.cardmarket.com/en/Magic', active: false });
+  await waitForTabComplete(created.id);
+  // Give document_idle content script a brief beat to register.
+  for (let i = 0; i < 10; i += 1) {
+    if (await pingTab(created.id)) return created.id;
+    await new Promise(r => setTimeout(r, 250));
+  }
+  return created.id;
+}
+
+async function getCardmarketTab() {
   if (!bridgeTabPromise) {
-    bridgeTabPromise = (async () => {
-      const created = await chrome.tabs.create({ url: 'https://www.cardmarket.com/en/Magic', active: false });
-      await waitForTabComplete(created.id);
-      // Give document_idle content script a brief beat to register.
-      for (let i = 0; i < 10; i += 1) {
-        if (await pingTab(created.id)) return created.id;
-        await new Promise(r => setTimeout(r, 250));
-      }
-      return created.id;
-    })().finally(() => { bridgeTabPromise = null; });
+    bridgeTabPromise = discoverCardmarketTab()
+      .then(tabId => {
+        cachedBridgeTabId = tabId;
+        return tabId;
+      })
+      .finally(() => { bridgeTabPromise = null; });
   }
   return bridgeTabPromise;
+}
+
+async function sendToBridgeTab(message, { useCache = true } = {}) {
+  // Fast path for idempotent GET/token messages: reuse the last known responsive Cardmarket tab
+  // directly instead of paying a tabs.query + cm-ping IPC roundtrip on every single request.
+  if (useCache && cachedBridgeTabId != null) {
+    const tabId = cachedBridgeTabId;
+    try {
+      const result = await chrome.tabs.sendMessage(tabId, message);
+      if (result !== undefined) return result;
+    } catch {
+      // Tab navigated, reloaded, or closed: fall through to rediscover once.
+    }
+    if (cachedBridgeTabId === tabId) cachedBridgeTabId = null;
+  }
+  const tabId = await getCardmarketTab();
+  try {
+    const result = await chrome.tabs.sendMessage(tabId, message);
+    if (result === undefined && cachedBridgeTabId === tabId) cachedBridgeTabId = null;
+    return result;
+  } catch (error) {
+    if (cachedBridgeTabId === tabId) cachedBridgeTabId = null;
+    throw error;
+  }
 }
 
 async function loadIndex(game) {
@@ -197,8 +233,8 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     }
     (async () => {
       try {
-        const tabId = await getCardmarketTab();
-        const result = await chrome.tabs.sendMessage(tabId, message);
+        const isGet = !message.method || message.method === 'GET';
+        const result = await sendToBridgeTab(message, { useCache: isGet });
         reply(result);
       } catch (error) {
         reply({ error: error?.message || String(error) });
@@ -214,8 +250,7 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
     }
     (async () => {
       try {
-        const tabId = await getCardmarketTab();
-        const result = await chrome.tabs.sendMessage(tabId, { type: 'cm-token' });
+        const result = await sendToBridgeTab({ type: 'cm-token' }, { useCache: true });
         reply(result || { token: null });
       } catch {
         reply({ token: null });

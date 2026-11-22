@@ -66,25 +66,34 @@ Implemented in `browserSite().request()` (`collector.js`):
 
 ### A. Minimize Request Count and Avoid Throttled Endpoints (`collectBySellers`)
 
-The default **By seller** method (`collector.js:collectBySellers`) cuts a ~119-card Wants List from **~900 `/Products` requests (~45–60 min)** to **~240 `/Cards` + `/Users` requests (~4.5 min)**:
+The default **By seller** method (`collector.js:collectBySellers`) cuts a ~114-card Wants List from **~900 `/Products` requests (~45–60 min)** down to **~280–310 `/Cards` + `/Users` requests (~2 min cold)** — keeping total volume safely below Cloudflare's high-volume `403` zone:
 
 1. **Phase 1 — Card pages in expansion groups (`GET /Cards/...`, bucket `cards`):**
    - Groups a card's printings by expansion (`≤12` expansions per group), ordered cheapest guide price first.
    - Stops reading further groups once the next group's lowest guide price cannot beat the card's cutoff (`max(2 × target, target + €0.50)`, clamped by `maxPriceCents`).
+   - Deduplicates concurrent identical cache keys in-flight (`inFlight` map in `cached()`).
+   - In EU / multi-country mode, merges cached domestic pages at zero cost and only fetches an extra domestic page when page 1 is full (`≥45` rows) and fewer than `domesticMinOffers = 10` (`domesticProductMinOffers = 15` for products) domestic sellers survived crowding.
    - **Thorough mode** avoids `POST /AjaxAction/Product_LoadMoreArticles` completely by issuing 3 plain `GET /Cards/...` requests split by seller type (private / professional / powerseller = up to 3 × 50 = 150 non-overlapping offers per group).
-2. **Phase 2 — Seller Wants-overlap pages (`GET /Users/<seller>/Offers/Singles?idWantslist=<id>`, bucket `users`):**
+2. **Phase 2 — Seller Wants-overlap pages (`GET /Users/<seller>/Offers/Singles?idWantslist=<id>&sortBy=price_asc`, bucket `users`):**
    - Ranks sellers by how many wanted cards they offer under cutoff.
-   - Fetches each chosen seller's full Wants List overlap (20 rows/page, up to `maxSellerPages = 15`) in adaptive batches: **40 sellers initially**, then **+20 per batch**, stopping as soon as a batch improves the basket by less than `improvementCents` (`€1.00` default; `€0.20` in Thorough) or hits `sellerLimit` (`150` default; `200` in Thorough).
+   - Requests seller overlap **sorted cheapest-first (`sortBy=price_asc`)** and stops paging a seller early as soon as ascending row prices exceed the highest remaining `max(cutoff, target + €1.50)` ceiling among cards that seller has not yet supplied cheaply (falling back to full paging up to `maxSellerPages` if rows are unsorted or any card has no cutoff).
+   - Fetches in smaller adaptive batches: **20 sellers initially**, then **+10 per batch** (Quick: `maxSellerPages = 8`; Thorough: `80 + 20`, `maxSellerPages = 15`), stopping as soon as a batch improves the basket by less than `improvementCents` (`€1.00` default; `€0.20` in Thorough) or hits `sellerLimit`.
+   - In multi-game runs, skips querying a seller for another game where they had zero Phase-1 appearances across `≥5` wanted cards of that game.
 3. **Bulk Cart Writes (`POST /AjaxAction/ShoppingCart_Add_AddArticlesFromUserOffers`, bucket `cart`):**
-   - Sends **1 POST per seller** (~15 requests) instead of 1 POST per card (~118 requests).
+   - Sends **1 POST per seller** (~15 requests) instead of 1 POST per card (~118 requests), strictly sequential (`concurrency: 1`).
    - Falls back to per-item `ShoppingCart_Add_AddArticlesFromProductPage` only on deterministic XML business-logic rejections — **never** on `RetryableError`, `RefusedError`, or `TypeError`, where partial/duplicate cart state is ambiguous.
 
-### B. Pacing, Buckets, Backoff, and Cooldown Persistence (`createRunner` in `collector.js`, `app.js`)
+### B. Pacing, Buckets, Adaptive Backoff, and Cooldown Persistence (`createRunner` in `collector.js`, `app.js`, `background.js`)
 
 - **Global & per-bucket pacing (`pacer`):**
-  - Default `intervalMs = 1000` (Careful: 1 req/s; user-selectable 2000 ms / 1000 ms / 500 ms), `concurrency = 2`.
-  - Cart bucket enforces a separate **`bucketIntervals: { cart: 2000 }`** (at least 2 s between cart POSTs).
+  - Default `intervalMs = 400` (**Fast & adaptive**: ~2.5 req/s with ±15% jitter; user-selectable 400 / 600 / 1000 / 2000 ms), `concurrency = 4` for read buckets so 0.8–1.5 s network RTT does not stall pacing.
+  - Strict per-bucket floors protect sensitive endpoints regardless of global speed:
+    - **`products: 3000`** (`≤0.33 req/s` on `GET /Products/*`, staying inside the ~0.3 req/s empirical ceiling).
+    - **`cart: 2000`** (at least 2 s between cart POSTs, with `concurrency: 1` and `intervalMs >= 1000` in `app.js`).
   - `pace.holds` tracks `Retry-After` holds **per bucket** (`products`, `cards`, `users`, `cart`) so a hold on one bucket does not needlessly stall unrelated buckets.
+- **Adaptive AIMD backoff on reads (`createRunner.read`):**
+  - On any rate-limit (`429`), Cloudflare challenge (`BlockedError`), or refusal (`RefusedError`), slows pacing multiplicatively (`1.75×`, debounced per failure wave, up to 10 s) on both the global pacer and the hit bucket.
+  - After **25 consecutive clean `200 OK` responses** on a bucket, gently recovers pacing (`0.9×`) back toward the user's base `intervalMs` (never below per-bucket floors).
 - **Read path retry schedule (`app.js` → `createRunner.read`):**
   - `readRetryDelays: [5000, 10000, 20000, 40000, 80000]` (5 retries = **2 min 35 s** total backoff) within `readRetryBudgetMs = 180000` (**3 min**).
   - Retries `RetryableError`, `RefusedError`, and non-login `BlockedError`; stops immediately on `login: true`.
@@ -94,6 +103,8 @@ The default **By seller** method (`collector.js:collectBySellers`) cuts a ~119-c
   - First `BlockedError` auto-waits **10 s** (`app.js:waitForUser`), slows pacing by `1.5×` (up to 10 s), and retries once; subsequent failures pause for manual **Continue**.
   - Stops after **3 consecutive `RefusedError`s** or **10 consecutive pauses without success**.
   - Never retries cart `5xx` (only `429` with `cause === 'rate'`).
+- **Cached bridge tab routing (`background.js`):**
+  - Caches the active Cardmarket bridge tab ID (`cachedBridgeTabId`) for idempotent `GET`/`cm-token` requests, eliminating a `chrome.tabs.query` + `cm-ping` IPC roundtrip on every read. Non-idempotent `POST` requests still validate the bridge tab before sending.
 
 ### C. Caching to Avoid Repeat Fetches
 
@@ -106,8 +117,8 @@ The default **By seller** method (`collector.js:collectBySellers`) cuts a ~119-c
 ## 6. Rules for Future Agents
 
 1. **Do not switch card collection back to `/Products/*` or `POST /AjaxAction/Product_LoadMoreArticles`.** Both are aggressively throttled by Cloudflare.
-2. **Keep non-card product volume modest.** Accessories (sleeves, deck boxes) have no `/Cards/` equivalent and must hit `GET /Products/*` (bucket `products`), which is fine for a few items per run but will hit `429` if scaled to dozens/hundreds.
-3. **Do not make Thorough mode the default.** In live benchmarks, Thorough (~680 reqs) triggered a 30-minute `403` Cloudflare challenge while saving only €0.32 over Fast (~240 reqs).
+2. **Keep non-card product volume modest and preserve the `products >= 3000ms` bucket floor.** Accessories (sleeves, deck boxes) have no `/Cards/` equivalent and must hit `GET /Products/*` (bucket `products`), which is fine for a few items per run but will hit `429` if scaled or sped up past ~0.3 req/s.
+3. **Do not make Thorough mode the default.** In live benchmarks, Thorough (~680 reqs) triggered a 30-minute `403` Cloudflare challenge while saving only €0.32 over Fast.
 4. **Never exceed ~15–20 expansions per `/Cards` query** (keep `expansionGroupSize <= 12`) or Cardmarket will silently hide older cheap printings.
 5. **Never bypass `createRunner` / `pacer` or add unpaced parallel requests** (especially for cart POSTs or `/AjaxAction/*`).
 6. **Never auto-retry non-idempotent cart POSTs on `5xx` or network errors**, and never blindly fall back to per-item adds after an ambiguous bulk-add error.

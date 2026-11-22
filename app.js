@@ -34,7 +34,10 @@
   const NON_EUROPE_IDS = [36, 29]; // Japan, Singapore
   const NON_EU_CUSTOMS_IDS = [13, 4, 24, 37, 18]; // UK, Switzerland, Norway, Iceland, Liechtenstein
   const EU_IDS = COUNTRIES.filter(([id]) => !NON_EUROPE_IDS.includes(id) && !NON_EU_CUSTOMS_IDS.includes(id)).map(([id]) => id);
-  const THOROUGH = { splitBySellerType: true, groupSkipFactor: 3, minSellers: 80, sellerBatch: 20, sellerLimit: 200, improvementCents: 20 };
+  const THOROUGH = { splitBySellerType: true, groupSkipFactor: 3, minSellers: 80, sellerBatch: 20, sellerLimit: 200, maxSellerPages: 15, improvementCents: 20 };
+  const DEFAULT_INTERVAL_MS = 400;
+  const VALID_INTERVALS = [400, 600, 1000, 2000];
+  const SETTINGS_VERSION = 2;
   const LIMIT_CANDIDATES = [50, 100, 200, 300, 500, 1000, 2000];
   const TRACKED_MEMORY_MS = 30 * 24 * 60 * 60 * 1000;
   const CART_MEMORY_MS = 12 * 60 * 60 * 1000;
@@ -145,7 +148,7 @@
     customCountries: [...NEIGHBOURS],
     shipTo: 7,
     method: 'sellers',
-    interval: 1000,
+    interval: DEFAULT_INTERVAL_MS,
     trackedSellers: {},      // { name: timestamp }
     collection: null,        // Current loaded/fetched collection
     basket: null,            // Current optimized basket
@@ -275,6 +278,7 @@
   async function saveSettings() {
     await chrome.storage.local.set({
       bwAppSettings: {
+        settingsVersion: SETTINGS_VERSION,
         selectedLists: state.selectedLists,
         regionMode: state.regionMode,
         customCountries: state.customCountries,
@@ -1999,7 +2003,9 @@
       let waitUntil = 0;
       const common = {
         sellerCountries,
+        concurrency: 4,
         intervalMs: state.interval,
+        bucketIntervals: { cart: 2000, products: 3000 },
         signal: controller.signal,
         cache,
         cacheMaxAgeMs: forceFresh ? 0 : CACHE_MAX_AGE_MS,
@@ -2012,7 +2018,7 @@
           waitingText = `Cardmarket asked to slow down — retry ${retry}/5 at ${new Date(until).toLocaleTimeString()}`;
           showProgress('Waiting for Cardmarket rate limit…', waitingText, null);
         },
-        onProgress: ({ phase, done, total, requests, retries }) => {
+        onProgress: ({ phase, done, total, requests, retries, intervalMs }) => {
           if (Date.now() > waitUntil) waitingText = '';
           const pct = phase === 'sellers'
             ? 60 + Math.round((done / Math.max(1, total)) * 35)
@@ -2020,7 +2026,10 @@
           const title = phase === 'sellers'
             ? `Reading top sellers' overlap (${done}/${total})`
             : `Reading item pages (${done}/${total})`;
-          showProgress(title, `${requests} requests${retries ? ` · ${retries} retries` : ''}`, pct, waitingText);
+          const adapted = intervalMs && intervalMs > state.interval
+            ? ` · auto-paced ${(intervalMs / 1000).toFixed(1)}s/req`
+            : '';
+          showProgress(title, `${requests} requests${retries ? ` · ${retries} retries` : ''}${adapted}`, pct, waitingText);
         },
       };
 
@@ -2569,7 +2578,9 @@
     const failed = [];
     let done = 0;
     const runner = createRunner(site, {
-      intervalMs: state.interval,
+      concurrency: 1,
+      intervalMs: Math.max(state.interval, 1000),
+      bucketIntervals: { cart: 2000 },
       signal: controller.signal,
       waitForUser,
       log: record,
@@ -3025,7 +3036,9 @@
         tokenIds: new Set(catalog.byId.keys()),
         cache,
         cacheMaxAgeMs: CACHE_MAX_AGE_MS,
+        concurrency: 4,
         intervalMs: state.interval,
+        bucketIntervals: { cart: 2000, products: 3000 },
         signal: controller.signal,
         waitForUser,
         log: record,
@@ -3160,7 +3173,15 @@
     state.customCountries = Array.isArray(s.customCountries) ? s.customCountries : [...NEIGHBOURS];
     state.shipTo = s.shipTo || 7;
     state.method = s.method || 'sellers';
-    state.interval = s.interval || 1000;
+    const savedInterval = Number(s.interval);
+    if (!s.settingsVersion) {
+      // Upgrade legacy default (1000 ms) and removed 500 ms preset to the new adaptive default,
+      // while preserving an explicit Very careful (2000 ms) choice.
+      state.interval = savedInterval === 2000 ? 2000 : DEFAULT_INTERVAL_MS;
+      if (data.bwAppSettings) await saveSettings();
+    } else {
+      state.interval = VALID_INTERVALS.includes(savedInterval) ? savedInterval : DEFAULT_INTERVAL_MS;
+    }
 
     $('shipTo').value = state.shipTo;
     $('method').value = state.method;

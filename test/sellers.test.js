@@ -174,3 +174,113 @@ test('a specific printing missing from the catalogue accepts only its own id, in
   assert.ok(a.offers.every(o => o.idProduct === 99), 'other printings are rejected');
   assert.ok(a.offers.some(o => o.seller === 'big' && o.priceCents === 90), 'seller-mode Phase 2 matches the wanted id');
 });
+
+test('Phase 2 stops paging early when ascending seller offers exceed remaining card ceilings', async () => {
+  // Cards a and b have target ~14-24 cents, cutoff ~64-74 cents, ceiling with +150 margin ~164-174 cents.
+  const plan = { entries: [want('a', [1]), want('b', [2]), want('c', [3])] };
+  const cardOffers = {
+    a: [offer('mega', 1, 10), offer('s1', 1, 11), offer('s2', 1, 12), offer('s3', 1, 13), offer('s4', 1, 14)],
+    b: [offer('mega', 2, 20), offer('s1', 2, 21), offer('s2', 2, 22), offer('s3', 2, 23), offer('s4', 2, 24)],
+    c: [offer('s1', 3, 30), offer('s2', 3, 31), offer('s3', 3, 32), offer('s4', 3, 33), offer('s5', 3, 34)],
+  };
+  // mega has 5 ascending pages (2 rows/page): page 1 cheap (10, 20), page 2 crosses ceiling (80, 500),
+  // pages 3-5 are expensive foils (600..2000) that cannot beat c's ceiling (184).
+  const inventories = {
+    mega: [
+      offer('mega', 1, 10), offer('mega', 2, 20),
+      offer('mega', 3, 80), offer('mega', 3, 500),
+      offer('mega', 1, 600), offer('mega', 2, 700),
+      offer('mega', 3, 1200), offer('mega', 1, 1500),
+      offer('mega', 2, 1800), offer('mega', 3, 2000),
+    ],
+  };
+  const site = fakeSite(cardOffers, inventories, { pageSize: 2 });
+  const run = await collectBySellers(plan, site, { ...options, maxSellerPages: 10 });
+  const mega = run.sellers.find(s => s.seller === 'mega');
+  assert.equal(mega.pages, 2, 'stops at page 2 once ascending prices pass remaining ceiling');
+  assert.equal(mega.ceilingStopped, true);
+  assert.equal(mega.status, 'complete');
+  assert.ok(run.results.find(r => r.key === 'c').offers.some(o => o.seller === 'mega' && o.priceCents === 80));
+
+  // Unsorted seller pages must NOT early-stop so a cheap row on a later page is never missed.
+  const unsorted = {
+    mega: [
+      offer('mega', 1, 500), offer('mega', 2, 10), // non-ascending on page 1!
+      offer('mega', 3, 600), offer('mega', 1, 700),
+      offer('mega', 3, 45), // cheap offer buried on page 3
+    ],
+  };
+  const site2 = fakeSite(cardOffers, unsorted, { pageSize: 2 });
+  const run2 = await collectBySellers(plan, site2, { ...options, maxSellerPages: 10 });
+  const mega2 = run2.sellers.find(s => s.seller === 'mega');
+  assert.equal(mega2.pages, 3, 'unsorted rows disable price ceiling early stop');
+  assert.equal(mega2.ceilingStopped, false);
+  assert.ok(run2.results.find(r => r.key === 'c').offers.some(o => o.seller === 'mega' && o.priceCents === 45));
+});
+
+test('deduplicates concurrent identical card queries in-flight and honors concurrency > 2', async () => {
+  // Two entries pointing to the exact same cardPath & filters across two lists, plus 4 distinct cards.
+  const plan = {
+    entries: [
+      want('dup1', [1], { cardPath: '/en/Magic/Cards/Shared', listId: '10' }),
+      want('dup2', [1], { cardPath: '/en/Magic/Cards/Shared', listId: '20' }),
+      want('c1', [2], { listId: '10' }),
+      want('c2', [3], { listId: '10' }),
+      want('c3', [4], { listId: '10' }),
+      want('c4', [5], { listId: '10' }),
+    ],
+  };
+  let active = 0;
+  let maxActive = 0;
+  const cardPathsCalled = [];
+  const site = {
+    async cardPage(entry) {
+      cardPathsCalled.push(entry.cardPath);
+      active += 1;
+      if (active > maxActive) maxActive = active;
+      await new Promise(r => setTimeout(r, 25));
+      active -= 1;
+      return { offers: [offer('s1', entry.printings[0].idProduct, 50)], skipped: 0 };
+    },
+    async sellerWants() { return { offers: [], skipped: 0, total: 0, hasNext: false }; },
+  };
+  const run = await collectBySellers(plan, site, {
+    ...options,
+    lists: [{ game: 'Magic', listId: '10' }, { game: 'Magic', listId: '20' }],
+    concurrency: 4,
+    cache: new Map(),
+  });
+  assert.equal(cardPathsCalled.filter(p => p === '/en/Magic/Cards/Shared').length, 1, 'duplicate card page fetched only once');
+  assert.ok(maxActive >= 4, `expected concurrency >= 4 in flight, got ${maxActive}`);
+  assert.equal(run.results.find(r => r.key === 'dup1').offers.length, 1);
+  assert.equal(run.results.find(r => r.key === 'dup2').offers.length, 1);
+});
+
+test('multi-game Phase 2 skips querying a single-game seller on a large list of another game', async () => {
+  const mtgEntries = Array.from({ length: 5 }, (_, i) => want(`m${i}`, [100 + i], { game: 'Magic', listId: '10' }));
+  const ygoEntries = Array.from({ length: 5 }, (_, i) => want(`y${i}`, [200 + i], { game: 'YuGiOh', listId: '20', cardPath: `/en/YuGiOh/Cards/y${i}` }));
+  const plan = { entries: [...mtgEntries, ...ygoEntries] };
+
+  const cardOffers = {};
+  for (let i = 0; i < 5; i += 1) {
+    cardOffers[`m${i}`] = [offer('mtgOnly', 100 + i, 10), offer('crossShop', 100 + i, 11)];
+    cardOffers[`y${i}`] = [offer('ygoOnly', 200 + i, 10), offer('crossShop', 200 + i, 11)];
+  }
+  const sellerCalls = [];
+  const site = {
+    async cardPage(entry) { return { offers: cardOffers[entry.key] || [], skipped: 0 }; },
+    async sellerWants(seller, listId, page, game) {
+      sellerCalls.push({ seller, listId, game });
+      return { offers: [], skipped: 0, total: 0, hasNext: false };
+    },
+  };
+  await collectBySellers(plan, site, {
+    ...options,
+    lists: [{ game: 'Magic', listId: '10' }, { game: 'YuGiOh', listId: '20' }],
+  });
+
+  const gamesFor = seller => sellerCalls.filter(c => c.seller === seller).map(c => c.game).sort();
+  assert.deepEqual(gamesFor('mtgOnly'), ['Magic'], 'Magic-only seller skips Yu-Gi-Oh! list');
+  assert.deepEqual(gamesFor('ygoOnly'), ['YuGiOh'], 'Yu-Gi-Oh!-only seller skips Magic list');
+  assert.deepEqual(gamesFor('crossShop'), ['Magic', 'YuGiOh'], 'cross-game seller is queried on both lists');
+});
