@@ -10,6 +10,10 @@
   const {
     parseShippingTable, scopeKey, filterByLimits, matchesScope,
   } = globalThis.CardmarketWizard;
+  const {
+    collectBasketEntries, collectLeftOutEntries, groupExportEntries,
+    formatArchidektExport, formatPlainExport, safeExportFilename,
+  } = globalThis.CardmarketExport;
 
   const COUNTRIES = [
     [1, 'Austria'], [2, 'Belgium'], [3, 'Bulgaria'], [35, 'Croatia'], [5, 'Cyprus'], [6, 'Czech Republic'],
@@ -816,17 +820,20 @@
     const leftBar = $('leftOutBar');
     if (state.leftOut.length) {
       const totalCopies = state.leftOut.reduce((s, r) => s + (r.amount || 1), 0);
-      const hasMagic = state.leftOut.some(r => (r.game || 'Magic') === 'Magic' && r.kind !== 'product');
+      const leftEntries = leftOutEntries();
+      const plainGroups = groupExportEntries(leftEntries, 'plain');
+      const archGroups = groupExportEntries(leftEntries, 'archidekt');
+      const hasMagic = archGroups.length > 0;
       leftBar.hidden = false;
       leftBar.innerHTML = `
         <div><strong>Left out (${totalCopies} cards):</strong> ${state.leftOut.slice(0, 8).map(r => esc(r.name)).join(', ')}${state.leftOut.length > 8 ? ` + ${state.leftOut.length - 8} more` : ''}</div>
         <div class="toolbar-group">
-          <button type="button" id="btnCopyLeftPlain" class="btn btn-secondary btn-xs">Copy left-out list</button>
-          ${hasMagic ? '<button type="button" id="btnCopyLeftArchidekt" class="btn btn-secondary btn-xs">Copy left-out for Archidekt</button>' : ''}
+          <button type="button" id="btnCopyLeftPlain" class="btn btn-secondary btn-xs">${plainGroups.length > 1 ? 'Export left-out list ▾' : 'Copy left-out list'}</button>
+          ${hasMagic ? `<button type="button" id="btnCopyLeftArchidekt" class="btn btn-secondary btn-xs">${archGroups.length > 1 ? 'Export left-out for Archidekt ▾' : 'Copy left-out for Archidekt'}</button>` : ''}
           <button type="button" id="btnPutAllBack" class="btn btn-link btn-xs">Put all back</button>
         </div>`;
-      $('btnCopyLeftPlain').addEventListener('click', () => copyEntries(leftOutEntries(), 'plain', 'left-out items'));
-      $('btnCopyLeftArchidekt')?.addEventListener('click', () => copyEntries(leftOutEntries(), 'archidekt', 'left-out Magic cards'));
+      $('btnCopyLeftPlain').addEventListener('click', () => handleExportEntries(leftOutEntries(), 'plain', 'left-out items'));
+      $('btnCopyLeftArchidekt')?.addEventListener('click', () => handleExportEntries(leftOutEntries(), 'archidekt', 'left-out Magic cards'));
       $('btnPutAllBack').addEventListener('click', async () => {
         if (workInProgress()) return;
         state.manualCuts = [];
@@ -897,6 +904,7 @@
     const n = Math.min(max, Math.max(1, Number($('buySellers').value) || max));
     const pt = state.basket.curve[n - 1];
     $('buySummary').textContent = pt ? `${pt.cards} items · ${euros(pt.totalCents)} total` : '';
+    updateExportButtons();
   }
 
   function updateSellerCollapseControls() {
@@ -926,9 +934,6 @@
     $('buySellers').max = Math.max(1, b.parcels.length);
     $('buySellers').value = b.parcels.length;
     updateBuySummary();
-
-    const hasMagic = b.parcels.some(p => p.items.some(i => (i.game || 'Magic') === 'Magic' && i.kind !== 'product'));
-    $('btnCopyArchidekt').hidden = !hasMagic;
 
     // Missing items
     const reasons = {
@@ -1497,64 +1502,230 @@
     toast(`Opened run from ${new Date(col.stats.finishedAt).toLocaleString()}.`, 'success');
   }
 
-  // ---- Exports (Plain grouped by game & Archidekt for Magic) ----
+  // ---- Exports (Plain & Archidekt, combined or per Wants List) ----
+  const scryfallPrintingCache = new Map();
+
   function basketEntries() {
+    if (!state.basket) return [];
     const n = Math.max(1, Number($('buySellers').value) || state.basket.parcels.length);
-    const parcels = state.basket.parcels.slice(0, n);
-    const map = new Map();
-    for (const [order, parcel] of parcels.entries()) {
-      for (const item of parcel.items) {
-        const id = `${parcel.seller}|${item.game}|${item.kind}|${item.idProduct}|${item.name}|${item.foil}`;
-        const entry = map.get(id) || {
-          name: item.name, game: item.game || 'Magic', kind: item.kind || 'card',
-          idProduct: item.idProduct, foil: item.foil, seller: parcel.seller, order, quantity: 0,
-        };
-        entry.quantity += 1;
-        map.set(id, entry);
-      }
-    }
-    return [...map.values()];
+    return collectBasketEntries(state.basket.parcels.slice(0, n));
   }
 
   function leftOutEntries() {
-    return state.leftOut.map((r, order) => ({
-      name: r.name, game: r.game || 'Magic', kind: r.kind || 'card',
-      idProduct: r.idProduct ?? null, foil: false, seller: null, order, quantity: r.amount || 1,
-    }));
+    return collectLeftOutEntries(state.leftOut);
   }
 
-  async function copyEntries(entries, format, label) {
-    try {
-      let text = '';
-      if (format === 'plain') {
-        const groups = new Map();
-        for (const e of entries) {
-          const g = e.kind === 'product' ? 'Extra Products' : e.game === 'YuGiOh' ? 'Yu-Gi-Oh!' : 'Magic';
-          if (!groups.has(g)) groups.set(g, new Map());
-          const m = groups.get(g);
-          m.set(e.name, (m.get(e.name) || 0) + e.quantity);
+  function updateExportButtons() {
+    if (!state.basket) return;
+    const entries = basketEntries();
+    const archGroups = groupExportEntries(entries, 'archidekt');
+    const plainGroups = groupExportEntries(entries, 'plain');
+    $('btnCopyArchidekt').hidden = archGroups.length === 0;
+    $('btnCopyArchidekt').textContent = archGroups.length > 1 ? 'Export for Archidekt ▾' : 'Copy for Archidekt';
+    $('btnCopyPlain').textContent = plainGroups.length > 1 ? 'Export list ▾' : 'Copy list';
+  }
+
+  async function resolvePrintings(entries) {
+    const ids = [...new Set(
+      (entries || [])
+        .filter(e => (e.game || 'Magic') === 'Magic' && e.kind !== 'product')
+        .map(e => e.idProduct)
+        .filter(Boolean)
+    )];
+    const missing = ids.filter(id => !scryfallPrintingCache.has(id));
+    if (missing.length) {
+      toast('Looking up Scryfall set codes…');
+      const { found = {}, error } = await chrome.runtime.sendMessage({ type: 'printings', ids: missing });
+      if (error) throw new Error(error);
+      for (const id of missing) scryfallPrintingCache.set(id, found[id] || null);
+    }
+    const result = {};
+    for (const id of ids) {
+      const hit = scryfallPrintingCache.get(id);
+      if (hit) result[id] = hit;
+    }
+    return result;
+  }
+
+  function downloadTextFile(text, filename) {
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function buildExportText(entries, format, { categoryBy = 'seller', groupBy = 'auto', preloadEntries = null } = {}) {
+    if (format === 'plain') {
+      return formatPlainExport(entries, { groupBy });
+    }
+    const magicOnly = (entries || []).filter(e => (e.game || 'Magic') === 'Magic' && e.kind !== 'product');
+    if (!magicOnly.length) return { text: '', count: 0 };
+    const found = await resolvePrintings(preloadEntries || magicOnly);
+    return formatArchidektExport(magicOnly, found, { categoryBy });
+  }
+
+  function closeExportModal() {
+    $('exportModal').hidden = true;
+  }
+
+  function openExportModal(entries, format, label) {
+    const groups = groupExportEntries(entries, format);
+    if (!groups.length) {
+      toast(format === 'archidekt' ? 'No Magic cards to export for Archidekt.' : 'Nothing to export.', 'error');
+      return;
+    }
+    const isArchidekt = format === 'archidekt';
+    const totalEligible = groups.reduce((s, g) => s + g.quantity, 0);
+    const totalAll = entries.reduce((s, e) => s + (e.quantity || 1), 0);
+    const skippedNonMagic = isArchidekt ? Math.max(0, totalAll - totalEligible) : 0;
+    const hasSellers = groups.some(g => g.sellerCount > 0);
+
+    $('exportModalTitle').textContent = isArchidekt ? 'Export for Archidekt' : 'Export list';
+    $('exportModalSub').textContent = `${groups.length} lists · ${totalEligible} ${isArchidekt ? 'Magic cards' : 'items'} — copy or download each Wants List separately, or export everything combined.`;
+
+    const notice = $('exportModalNotice');
+    if (skippedNonMagic > 0) {
+      notice.hidden = false;
+      notice.textContent = `Archidekt supports Magic cards only — ${skippedNonMagic} non-Magic / product item${skippedNonMagic === 1 ? '' : 's'} omitted here (use Export list for those).`;
+    } else {
+      notice.hidden = true;
+    }
+
+    const catRow = $('exportCategoryRow');
+    const catSelect = $('exportCategoryBy');
+    if (isArchidekt) {
+      catRow.hidden = false;
+      const options = hasSellers
+        ? [
+            ['seller', 'Seller name — [Seller]'],
+            ['list', 'Wants List name — [Wants List]'],
+            ['none', 'No category tag'],
+          ]
+        : [
+            ['list', 'Wants List name — [Wants List]'],
+            ['none', 'No category tag'],
+          ];
+      catSelect.innerHTML = options.map(([v, txt]) => `<option value="${v}">${esc(txt)}</option>`).join('');
+      catSelect.value = hasSellers ? 'seller' : 'list';
+    } else {
+      catRow.hidden = true;
+    }
+
+    const badgeFor = g => {
+      if (g.kind === 'product') return '<span class="badge badge-product">Product</span>';
+      return `<span class="badge ${g.game === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${g.game === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`;
+    };
+
+    const listEl = $('exportModalList');
+    listEl.innerHTML = groups.map((g, idx) => `
+      <div class="export-row">
+        <div class="export-row-info">
+          <div class="export-row-title">
+            ${badgeFor(g)}
+            <span class="export-row-name" title="${esc(g.label)}">${esc(g.label)}</span>
+          </div>
+          <div class="export-row-meta">
+            ${g.quantity} ${g.kind === 'product' ? (g.quantity === 1 ? 'item' : 'items') : (g.quantity === 1 ? 'card' : 'cards')}${g.sellerCount ? ` · ${g.sellerCount} seller${g.sellerCount === 1 ? '' : 's'}` : ''}
+          </div>
+        </div>
+        <div class="export-row-actions">
+          <button type="button" class="btn btn-primary btn-xs" data-export-copy="${idx}">Copy</button>
+          <button type="button" class="btn btn-secondary btn-xs" data-export-dl="${idx}" title="Download as .txt">.txt</button>
+        </div>
+      </div>`).join('');
+
+    catSelect.onchange = () => {
+      listEl.querySelectorAll('[data-export-copy]').forEach(btn => {
+        btn.classList.remove('btn-copied');
+        btn.classList.add('btn-primary');
+        btn.textContent = 'Copy';
+      });
+    };
+
+    const runAction = async (btn, targetEntries, targetName, isDownload, isCombined) => {
+      const prevText = btn.textContent;
+      btn.disabled = true;
+      try {
+        const categoryBy = isArchidekt ? catSelect.value : 'none';
+        const { text, count } = await buildExportText(targetEntries, format, {
+          categoryBy,
+          groupBy: isCombined ? 'list' : 'none',
+          preloadEntries: isArchidekt ? entries : null,
+        });
+        if (!count || !text) {
+          toast('Nothing to export.', 'error');
+          return;
         }
-        const multi = groups.size > 1;
-        text = [...groups].map(([g, map]) => {
-          const lines = [...map].map(([name, qty]) => `${qty} ${name}`).join('\n');
-          return multi ? `# ${g}\n${lines}` : lines;
-        }).join('\n\n');
-      } else {
-        const magicOnly = entries.filter(e => e.game === 'Magic' && e.kind !== 'product');
-        if (!magicOnly.length) { toast('No Magic cards to export for Archidekt.', 'error'); return; }
-        toast('Looking up Scryfall set codes…');
-        const ids = [...new Set(magicOnly.map(e => e.idProduct).filter(Boolean))];
-        const { found, error } = await chrome.runtime.sendMessage({ type: 'printings', ids });
-        if (error) throw new Error(error);
-        text = [...magicOnly].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name)).map(entry => {
-          const printing = found[entry.idProduct];
-          const card = printing ? `${printing.name} (${printing.set}) ${printing.number}` : entry.name;
-          return `${entry.quantity}x ${card}${entry.foil ? ' *F*' : ''}${entry.seller ? ` [${entry.seller.replace(/[[\]]/g, '')}]` : ''}`;
-        }).join('\n');
+        const scopeDesc = isCombined ? `all ${groups.length} lists` : `"${targetName}"`;
+        if (isDownload) {
+          const suffix = isArchidekt ? 'archidekt' : 'list';
+          downloadTextFile(text, safeExportFilename(isCombined ? `all-${label}` : targetName, suffix));
+          toast(`Downloaded ${count} ${isArchidekt ? 'Magic cards' : 'items'} (${scopeDesc}).`, 'success');
+        } else {
+          await navigator.clipboard.writeText(text);
+          if (!isCombined) {
+            btn.classList.remove('btn-primary');
+            btn.classList.add('btn-copied');
+            btn.textContent = 'Copied ✓';
+          }
+          toast(`Copied ${count} ${isArchidekt ? 'Magic cards' : 'items'} (${scopeDesc})${isArchidekt ? ' for Archidekt' : ''}.`, 'success');
+        }
+      } catch (error) {
+        btn.textContent = prevText;
+        toast(`Export failed: ${error.message}`, 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    listEl.querySelectorAll('[data-export-copy]').forEach(btn => {
+      const g = groups[Number(btn.dataset.exportCopy)];
+      btn.addEventListener('click', () => runAction(btn, g.entries, g.label, false, false));
+    });
+    listEl.querySelectorAll('[data-export-dl]').forEach(btn => {
+      const g = groups[Number(btn.dataset.exportDl)];
+      btn.addEventListener('click', () => runAction(btn, g.entries, g.label, true, false));
+    });
+
+    const copyAllBtn = $('exportCopyAll');
+    const dlAllBtn = $('exportDownloadAll');
+    copyAllBtn.onclick = () => runAction(copyAllBtn, entries, label, false, true);
+    dlAllBtn.onclick = () => runAction(dlAllBtn, entries, label, true, true);
+
+    $('exportModal').hidden = false;
+  }
+
+  async function handleExportEntries(entries, format, label) {
+    const groups = groupExportEntries(entries, format);
+    if (!groups.length) {
+      toast(format === 'archidekt' ? 'No Magic cards to export for Archidekt.' : 'Nothing to export.', 'error');
+      return;
+    }
+    if (groups.length > 1) {
+      openExportModal(entries, format, label);
+      return;
+    }
+    try {
+      const group = groups[0];
+      const hasSellers = group.sellerCount > 0;
+      const { text, count } = await buildExportText(group.entries, format, {
+        categoryBy: hasSellers ? 'seller' : 'none',
+        groupBy: 'none',
+      });
+      if (!count || !text) {
+        toast('Nothing to export.', 'error');
+        return;
       }
       await navigator.clipboard.writeText(text);
-      const count = entries.reduce((s, e) => s + e.quantity, 0);
-      toast(`Copied ${count} ${label} (${format === 'plain' ? 'plain' : 'Archidekt'}).`, 'success');
+      const totalAll = entries.reduce((s, e) => s + (e.quantity || 1), 0);
+      const skipped = format === 'archidekt' ? Math.max(0, totalAll - count) : 0;
+      const listNote = group.listName ? ` ("${group.label}")` : '';
+      const skipNote = skipped ? ` (${skipped} non-Magic skipped)` : '';
+      toast(`Copied ${count} ${label}${listNote} (${format === 'plain' ? 'plain' : 'Archidekt'})${skipNote}.`, 'success');
     } catch (error) {
       toast(`Copy failed: ${error.message}`, 'error');
     }
@@ -1886,8 +2057,12 @@
     $('btnCollapseAllSellers').addEventListener('click', () => setAllSellersExpanded(false));
     $('btnBuy').addEventListener('click', addToCart);
     $('btnCheckCart').addEventListener('click', () => checkCart());
-    $('btnCopyPlain').addEventListener('click', () => copyEntries(basketEntries(), 'plain', 'basket items'));
-    $('btnCopyArchidekt').addEventListener('click', () => copyEntries(basketEntries(), 'archidekt', 'Magic cards'));
+    $('btnCopyPlain').addEventListener('click', () => handleExportEntries(basketEntries(), 'plain', 'basket items'));
+    $('btnCopyArchidekt').addEventListener('click', () => handleExportEntries(basketEntries(), 'archidekt', 'Magic cards'));
+    $('exportModalClose').addEventListener('click', closeExportModal);
+    $('exportModalCloseX').addEventListener('click', closeExportModal);
+    $('exportModal').addEventListener('click', e => { if (e.target === $('exportModal')) closeExportModal(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('exportModal').hidden) closeExportModal(); });
     $('btnForgetCart').addEventListener('click', async () => {
       const { key } = await alreadyAdded();
       await chrome.storage.local.remove(key);

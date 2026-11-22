@@ -11,6 +11,7 @@ Unofficial Chrome MV3 extension (vanilla JS, no build step) that collects Cardma
 - `catalog.js` — Matches Wants List entries against Cardmarket's S3 catalogue and daily price guide (`idMetacard`, `idProduct`, `idExpansion`).
 - `collector.js` — HTML/XML parsers, `browserSite`, paced/retryable `createRunner`, per-printing `collect`, and seller-first `collectBySellers`.
 - `wizard.js` — Shipping table pricing, greedy quick basket, multi-strategy seller search (`optimise`), recommended cuts, and scoped price-limit suggestions.
+- `exports.js` — Pure, DOM-free Plain & Archidekt export grouping/formatting helpers (per Wants List or combined).
 - `optimizer-worker.js` — Web Worker wrapper around `wizard.js` with job-ID cancellation.
 - `app.html`, `app.css`, `app.js` — Full-page extension UI (`chrome-extension://.../app.html`).
 - `test/*.test.js` — Offline Node unit tests (`node --test test/*.test.js`).
@@ -23,7 +24,7 @@ Unofficial Chrome MV3 extension (vanilla JS, no build step) that collects Cardma
 node --test test/*.test.js
 
 # Syntax check edited files
-node --check app.js collector.js wizard.js background.js bridge.js content.js catalog.js optimizer-worker.js
+node --check app.js exports.js collector.js wizard.js background.js bridge.js content.js catalog.js optimizer-worker.js
 ```
 
 ## Non-Negotiable Cardmarket Rate-Limit & Cloudflare Rules

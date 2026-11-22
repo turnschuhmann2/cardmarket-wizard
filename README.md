@@ -27,8 +27,8 @@ After updating files, click **Reload** on the extension card in `chrome://extens
    - Open **Price Limits → Estimate limits** and pick a scope (**All cards**, **Magic only**, **Yu-Gi-Oh! only**, or any individual **Wants List**).
    - Estimates stream live from the Web Worker with loading skeletons. Applying or removing any limit immediately recomputes the **entire combined basket** from cache.
 5. **Export or Add to Cart:**
-   - **Copy list** exports plain text (grouped by game/products when combined).
-   - **Copy for Archidekt** exports Magic cards with Scryfall set codes, collector numbers, foil flags, and seller categories.
+   - **Copy / Export list** exports plain text either combined (grouped per Wants List & Extra Products) or one Wants List at a time (Copy or `.txt` download).
+   - **Copy / Export for Archidekt** exports Magic cards with Scryfall set codes, collector numbers, foil flags, and optional category tags (`[Seller]`, `[Wants List]`, or none). When multiple Magic Wants Lists are in the basket (or left-out list), a picker modal lets you copy or download each Wants List separately (marking copied lists with ✓) or export everything combined.
    - **Add to Cardmarket cart** adds items per seller, then reads back actual cart shipping and remembers tracked-only sellers automatically.
 
 ## Development
