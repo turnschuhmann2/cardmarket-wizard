@@ -426,7 +426,18 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); f
 .toast {
   background: #0f172a; color: #fff; padding: 10px 15px; border-radius: 10px;
   font-size: 13px; font-weight: 600; box-shadow: var(--shadow-lg); animation: popIn 0.15s ease-out;
+  display: flex; align-items: center; gap: 10px; max-width: 460px; flex-wrap: wrap;
 }
+.toast-msg { flex: 1; min-width: 0; }
+.toast-actions { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.toast-btn {
+  border: 1px solid rgba(255, 255, 255, 0.28); background: rgba(255, 255, 255, 0.14);
+  color: #fff; border-radius: 6px; padding: 3px 9px; font-size: 12px; font-weight: 700;
+  cursor: pointer; transition: background 0.12s;
+}
+.toast-btn:hover { background: rgba(255, 255, 255, 0.28); }
+.toast-btn-primary { background: #fff; color: #0f172a; border-color: #fff; }
+.toast-btn-primary:hover { background: #e2e8f0; }
 .toast-error { background: var(--rose); }
 .toast-success { background: #065f46; }
 
@@ -522,3 +533,51 @@ html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); f
 .share-cell { display: inline-flex; align-items: center; gap: 6px; justify-content: flex-end; }
 .share-bar-wrap { width: 54px; height: 6px; border-radius: 999px; background: #e2e8f0; overflow: hidden; display: inline-block; }
 .share-bar { height: 100%; background: var(--primary); border-radius: 999px; }
+
+/* Manual Seller / Card Removal (no recompute) */
+.parcel-remove-btn {
+  color: var(--text-muted); border-color: transparent; margin-left: 4px;
+}
+.parcel-remove-btn:hover {
+  color: var(--rose); background: #fff1f2; border-color: #fecdd3;
+}
+.col-action { width: 34px; text-align: right; white-space: nowrap; }
+.btn-icon-remove {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; border-radius: 6px; border: 1px solid transparent;
+  background: transparent; color: var(--text-muted); font-size: 16px; line-height: 1;
+  font-weight: 700; cursor: pointer; transition: all 0.12s;
+}
+.btn-icon-remove:hover { color: var(--rose); background: #fff1f2; border-color: #fecdd3; }
+
+.removed-box {
+  border: 1px solid #fed7aa; background: #fffbeb; border-radius: var(--radius-sm);
+  padding: 11px 14px; margin-bottom: 12px;
+}
+.removed-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+}
+.removed-title { font-size: 13.5px; color: #78350f; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.removed-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.removed-details { margin-top: 8px; border-top: 1px solid #fde68a; padding-top: 8px; }
+.removed-details summary {
+  cursor: pointer; font-size: 12.5px; font-weight: 600; color: #92400e; user-select: none;
+}
+.removed-groups { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.removed-seller-group {
+  border: 1px solid #fde68a; background: #fff; border-radius: var(--radius-sm); overflow: hidden;
+}
+.removed-seller-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+  padding: 6px 10px; background: #fefce8; border-bottom: 1px solid #fef08a; font-size: 12.5px;
+}
+.removed-seller-name { font-weight: 700; color: var(--text); }
+.removed-seller-items { display: flex; flex-direction: column; }
+.removed-item-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 6px 10px; border-bottom: 1px solid #f1f5f9; font-size: 12.5px;
+}
+.removed-item-row:last-child { border-bottom: none; }
+.removed-item-info { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.removed-item-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.removed-item-price { color: var(--text-muted); font-variant-numeric: tabular-nums; font-size: 12px; }

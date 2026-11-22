@@ -837,8 +837,149 @@
     };
   }
 
+  function basketItemSignature(seller, item) {
+    return `${seller || ""}|${item?.kind || "card"}|${item?.key || ""}|${item?.idArticle ?? ""}|${item?.idProduct ?? ""}|${item?.listId ?? ""}|${item?.foil ? 1 : 0}`;
+  }
+
+  // Non-destructively removes individual items or entire sellers from an already-computed basket
+  // WITHOUT recomputing or reassigning cards to other sellers. Remaining sellers keep their exact
+  // order and items; only affected parcels recalculate their itemsCents and shipping tier.
+  function applyBasketRemovals(basket, removedItems, { tables = null, trackedOnly = [] } = {}) {
+    if (!basket || !Array.isArray(removedItems) || !removedItems.length) return basket;
+
+    const dropCount = new Map();
+    for (const rec of removedItems) {
+      const sig = rec?.sig || (rec?.item ? basketItemSignature(rec.seller, rec.item) : null);
+      if (!sig) continue;
+      dropCount.set(sig, (dropCount.get(sig) || 0) + 1);
+    }
+    if (!dropCount.size) return basket;
+
+    const { defaultTable, byLocation } = tables ? normaliseTables(tables) : { defaultTable: null, byLocation: {} };
+    const trackedSet = new Set(trackedOnly || []);
+    const tableForParcel = parcel => {
+      if (!defaultTable) return null;
+      const base = (parcel.location && byLocation[parcel.location]) || defaultTable;
+      return trackedSet.has(parcel.seller) ? base.filter(m => m.tracked) : base;
+    };
+
+    const nextParcels = [];
+    let removedCount = 0;
+    let removedNonTokenCount = 0;
+
+    for (const parcel of basket.parcels || []) {
+      const items = parcel.items || [];
+      const kept = [];
+      let removedHere = 0;
+
+      for (const item of items) {
+        const sig = basketItemSignature(parcel.seller, item);
+        const left = dropCount.get(sig) || 0;
+        if (left > 0) {
+          dropCount.set(sig, left - 1);
+          removedHere += 1;
+          removedCount += 1;
+          if ((item.kind || "card") !== "token") removedNonTokenCount += 1;
+        } else {
+          kept.push(item);
+        }
+      }
+
+      if (removedHere === 0) {
+        nextParcels.push(parcel);
+        continue;
+      }
+      if (kept.length === 0) continue;
+
+      const itemsCents = kept.reduce((sum, it) => sum + (Number.isFinite(it.priceCents) ? it.priceCents : 0), 0);
+      const games = [...new Set(kept.filter(it => (it.kind || "card") !== "product" && it.game).map(it => it.game))];
+      const hasProducts = kept.some(it => it.kind === "product");
+      const tokenCount = kept.filter(it => it.kind === "token").length;
+      const hasTokens = tokenCount > 0;
+
+      let shippingCents = parcel.shippingCents;
+      let method = parcel.method;
+      const tbl = tableForParcel(parcel);
+      if (tbl && tbl.length) {
+        const simItems = kept.map(it => ({
+          kind: it.kind || "card",
+          offer: { shippingCents: it.offerShippingCents ?? null },
+        }));
+        const recalc = parcelShipping(tbl, simItems, itemsCents);
+        if (recalc && Number.isFinite(recalc.priceCents)) {
+          shippingCents = recalc.priceCents;
+          method = recalc.name || parcel.method;
+        }
+      }
+
+      nextParcels.push({
+        ...parcel,
+        items: kept,
+        itemsCents,
+        shippingCents,
+        method,
+        games,
+        hasProducts,
+        hasTokens,
+        tokenCount,
+      });
+    }
+
+    if (removedCount === 0) return basket;
+
+    let cards = 0;
+    let running = 0;
+    let totalShipping = 0;
+    let remainingTokens = 0;
+    let remainingTokenCents = 0;
+
+    const curve = nextParcels.map((parcel, index) => {
+      cards += parcel.items.length;
+      totalShipping += parcel.shippingCents;
+      running += parcel.itemsCents + parcel.shippingCents;
+      for (const it of parcel.items) {
+        if (it.kind === "token") {
+          remainingTokens += 1;
+          remainingTokenCents += Number.isFinite(it.priceCents) ? it.priceCents : 0;
+        }
+      }
+      return { sellers: index + 1, cards, totalCents: running };
+    });
+
+    let nextTokenStats = basket.tokenStats;
+    if (basket.tokenStats) {
+      if (remainingTokens === 0) {
+        nextTokenStats = null;
+      } else if (remainingTokens !== basket.tokenStats.physicalTokensBought) {
+        nextTokenStats = {
+          ...basket.tokenStats,
+          physicalTokensBought: remainingTokens,
+          tokensCents: remainingTokenCents,
+          totalAddedCents: remainingTokenCents,
+        };
+      }
+    }
+
+    const savedByRemovalsCents = Number.isFinite(basket.totalCents) && Number.isFinite(running)
+      ? Math.max(0, basket.totalCents - running)
+      : 0;
+
+    return {
+      ...basket,
+      parcels: nextParcels,
+      curve,
+      totalCents: running,
+      shippingCents: totalShipping,
+      tokenStats: nextTokenStats,
+      removedCount,
+      removedNonTokenCount,
+      savedByRemovalsCents,
+    };
+  }
+
   root.CardmarketWizard = {
     createPlanner, parseShippingTable, shipping, shippingByWeight, parcelShipping, weightOf,
-    scopeKey, matchesScope, effectiveLimitRule, filterByLimits, summarizeBasketBySource, STRATEGIES,
+    scopeKey, matchesScope, effectiveLimitRule, filterByLimits, summarizeBasketBySource,
+    basketItemSignature, applyBasketRemovals, STRATEGIES,
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

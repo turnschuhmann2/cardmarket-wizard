@@ -9,6 +9,7 @@
   } = globalThis.CardmarketCollector;
   const {
     parseShippingTable, parcelShipping, scopeKey, filterByLimits, matchesScope, summarizeBasketBySource,
+    basketItemSignature, applyBasketRemovals,
   } = globalThis.CardmarketWizard;
   const {
     collectBasketEntries, collectLeftOutEntries, groupExportEntries,
@@ -50,12 +51,33 @@
     return `${Math.round(hrs / 24)}d ago`;
   };
 
-  function toast(message, kind = 'default') {
+  function toast(message, kind = 'default', actions = []) {
     const el = document.createElement('div');
     el.className = `toast ${kind === 'error' ? 'toast-error' : kind === 'success' ? 'toast-success' : ''}`;
-    el.textContent = message;
+    const msg = document.createElement('span');
+    msg.className = 'toast-msg';
+    msg.textContent = message;
+    el.appendChild(msg);
+    let timer = null;
+    const close = () => { clearTimeout(timer); el.remove(); };
+    if (Array.isArray(actions) && actions.length) {
+      const wrap = document.createElement('div');
+      wrap.className = 'toast-actions';
+      for (const act of actions) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `toast-btn${act.primary ? ' toast-btn-primary' : ''}`;
+        btn.textContent = act.label;
+        btn.addEventListener('click', () => {
+          act.onClick?.(btn, close);
+          if (!act.keepOpen) close();
+        });
+        wrap.appendChild(btn);
+      }
+      el.appendChild(wrap);
+    }
     $('toastHost').appendChild(el);
-    setTimeout(() => el.remove(), 3600);
+    timer = setTimeout(close, actions.length ? 8500 : 3600);
   }
 
   // ---- Bridge Fetch (routes requests through an authenticated Cardmarket tab) ----
@@ -154,14 +176,25 @@
     sellerTokenOffers: {},
     tokenResult: null,
     includeTokensInBasket: true,
+    removedItems: [],        // [{ id, batchId, seller, sig, item }]
+    removedNextId: 1,
+    removedNextBatchId: 1,
+    removedListOpen: false,
   };
 
   function activeBasket() {
     if (!state.basket) return null;
+    let b = state.basket;
     if (state.includeTokensInBasket && state.tokenResult?.assignments?.length) {
-      return mergeTokensIntoBasket(state.basket, state.tokenResult);
+      b = mergeTokensIntoBasket(b, state.tokenResult);
     }
-    return state.basket;
+    if (state.removedItems.length) {
+      b = applyBasketRemovals(b, state.removedItems, {
+        tables: state.currentTables,
+        trackedOnly: Object.keys(state.trackedSellers),
+      });
+    }
+    return b;
   }
 
   const record = event => state.runLog.push({ t: new Date().toISOString(), ...event });
@@ -520,7 +553,7 @@
     $('btnRefetch').disabled = working;
     $('btnOpenRun').disabled = working;
     $('importFile').disabled = working;
-    $('btnBuy').disabled = working || state.optimising;
+    $('btnBuy').disabled = working || state.optimising || !(activeBasket()?.parcels?.length);
     const findTokensBtn = $('btnFindTokens');
     if (findTokensBtn) findTokensBtn.disabled = working || state.optimising || !state.basket;
     const reoptTokensBtn = $('btnReoptTokens');
@@ -826,25 +859,30 @@
   function renderKpis(optimising = false, note = '') {
     const b = activeBasket();
     if (!b) return;
-    const tokenCount = b.tokenStats?.physicalTokensBought || 0;
-    const covered = (b.curve.at(-1)?.cards || 0) - tokenCount;
-    const totalWanted = covered + b.missing.length;
+    const tokenCount = b.parcels.reduce((s, p) => s + p.items.filter(i => i.kind === 'token').length, 0);
+    const covered = Math.max(0, (b.curve.at(-1)?.cards || 0) - tokenCount);
+    const totalWanted = covered + b.missing.length + (b.removedNonTokenCount || 0);
     const itemsCents = b.totalCents - b.shippingCents;
     const crossCount = b.parcels.filter(p => (p.games?.length || 0) > 1 || p.hasProducts || p.hasTokens).length;
-    const tokenNote = tokenCount ? `Incl. +${tokenCount} token${tokenCount === 1 ? '' : 's'} (${euros(b.tokenStats.totalAddedCents)})` : '';
-    const subNote = optimising ? 'Searching for cheaper seller combos…'
-      : note && tokenNote ? `${note} · ${tokenNote}`
-        : note || tokenNote || 'Optimised total';
+    const tokenNote = tokenCount ? `Incl. +${tokenCount} token${tokenCount === 1 ? '' : 's'} (${euros(b.tokenStats?.totalAddedCents ?? 0)})` : '';
+    const removedNote = b.removedCount ? `-${euros(b.savedByRemovalsCents)} (${b.removedCount} removed)` : '';
+    const subParts = [note, removedNote, tokenNote].filter(Boolean);
+    const subNote = optimising ? 'Searching for cheaper seller combos…' : (subParts.join(' · ') || 'Optimised total');
 
     $('kpiTotal').textContent = euros(b.totalCents);
-    $('kpiTotalSub').className = `kpi-sub ${(note || tokenNote) ? 'good' : ''}`;
+    $('kpiTotalSub').className = `kpi-sub ${subParts.length ? 'good' : ''}`;
     $('kpiTotalSub').textContent = subNote;
     $('kpiSplit').textContent = `${euros(itemsCents)} + ${euros(b.shippingCents)}`;
     $('kpiSplitSub').textContent = `${b.totalCents ? Math.round((b.shippingCents / b.totalCents) * 100) : 0}% shipping`;
     $('kpiSellers').textContent = `${b.parcels.length}`;
-    $('kpiSellersSub').textContent = crossCount ? `${crossCount} combined parcel${crossCount > 1 ? 's' : ''}` : 'Optimized seller count';
+    $('kpiSellersSub').textContent = !b.parcels.length
+      ? 'All sellers removed'
+      : crossCount ? `${crossCount} combined parcel${crossCount > 1 ? 's' : ''}` : 'Optimized seller count';
     $('kpiItems').textContent = tokenCount ? `${covered}/${totalWanted} +${tokenCount}T` : `${covered} / ${totalWanted}`;
-    $('kpiItemsSub').textContent = b.missing.length ? `${b.missing.length} unavailable` : '100% covered';
+    const itemNotes = [];
+    if (b.missing.length) itemNotes.push(`${b.missing.length} unavailable`);
+    if (b.removedCount) itemNotes.push(`${b.removedCount} removed`);
+    $('kpiItemsSub').textContent = itemNotes.length ? itemNotes.join(' · ') : '100% covered';
     $('tabCountSellers').textContent = String(b.parcels.length);
   }
 
@@ -1050,12 +1088,20 @@
   function updateBuySummary() {
     const b = activeBasket();
     if (!b) return;
-    const max = Math.max(1, b.parcels.length);
+    if (!b.parcels.length) {
+      $('buySummary').textContent = '0 items · 0,00 € total';
+      renderBreakdown();
+      updateExportButtons();
+      syncBusyUI();
+      return;
+    }
+    const max = b.parcels.length;
     const n = Math.min(max, Math.max(1, Number($('buySellers').value) || max));
     const pt = b.curve[n - 1];
     $('buySummary').textContent = pt ? `${pt.cards} items · ${euros(pt.totalCents)} total` : '';
     renderBreakdown();
     updateExportButtons();
+    syncBusyUI();
   }
 
   function updateSellerCollapseControls() {
@@ -1079,17 +1125,332 @@
     updateSellerCollapseControls();
   }
 
-  function renderParcelsAndTabs({ resetBuySellers = true } = {}) {
+  // ---- Manual Seller / Card Removal (in-place, no recompute) ----
+  function removedRecordsToEntries(records) {
+    return (records || []).map((rec, order) => ({
+      name: rec.item.name,
+      game: rec.item.game || 'Magic',
+      kind: rec.item.kind || 'card',
+      listId: rec.item.listId ?? null,
+      listName: rec.item.listName ?? null,
+      idProduct: rec.item.idProduct ?? null,
+      foil: !!rec.item.foil,
+      seller: rec.seller,
+      order,
+      quantity: 1,
+    }));
+  }
+
+  async function copyRemovedRecords(records, format = 'plain', triggerBtn = null) {
+    const list = records || [];
+    if (!list.length) {
+      toast('Nothing to copy.', 'error');
+      return false;
+    }
+    const entries = removedRecordsToEntries(list);
+    try {
+      if (format === 'archidekt') {
+        const archGroups = groupExportEntries(entries, 'archidekt');
+        if (!archGroups.length) {
+          toast('No Magic cards among removed items to copy for Archidekt.', 'error');
+          return false;
+        }
+        const { text, count } = await buildExportText(entries, 'archidekt', {
+          categoryBy: archGroups.length > 1 ? 'list' : 'none',
+        });
+        if (!count || !text) {
+          toast('Nothing to copy.', 'error');
+          return false;
+        }
+        await navigator.clipboard.writeText(text);
+        const skipped = Math.max(0, list.length - count);
+        toast(
+          `Copied ${count} removed Magic card${count === 1 ? '' : 's'} for Archidekt${skipped ? ` (${skipped} non-Magic skipped)` : ''}.`,
+          'success',
+        );
+      } else {
+        const { text, count } = formatPlainExport(entries, { groupBy: 'auto' });
+        if (!count || !text) {
+          toast('Nothing to copy.', 'error');
+          return false;
+        }
+        await navigator.clipboard.writeText(text);
+        const label = count === 1 ? `"${list[0].item.name}"` : `${count} removed items`;
+        toast(`Copied ${label} to clipboard.`, 'success');
+      }
+      if (triggerBtn) {
+        const prev = triggerBtn.textContent;
+        triggerBtn.textContent = 'Copied ✓';
+        setTimeout(() => { if (triggerBtn.isConnected) triggerBtn.textContent = prev; }, 1600);
+      }
+      return true;
+    } catch (error) {
+      toast(`Copy failed: ${error.message}`, 'error');
+      return false;
+    }
+  }
+
+  function refreshAfterRemoval({ sellerDroppedAtIndex = -1 } = {}) {
+    const b = activeBasket();
+    if (b && sellerDroppedAtIndex >= 0) {
+      const cur = Number($('buySellers').value) || 0;
+      if (sellerDroppedAtIndex < cur && cur > 1) {
+        $('buySellers').value = Math.max(1, cur - 1);
+      }
+    }
+    renderKpis(false);
+    renderParcelsAndTabs({ resetBuySellers: false, preserveOpenSellers: true });
+  }
+
+  function applyRestoreRemovals(keepPredicate, toastMessage) {
+    if (state.optimising || state.fetching || state.carting) return;
+    const before = activeBasket();
+    const prevCount = before?.parcels?.length || 0;
+    const wasAllSelected = prevCount === 0 || Number($('buySellers').value) >= prevCount;
+    const next = state.removedItems.filter(keepPredicate);
+    if (next.length === state.removedItems.length) return;
+    state.removedItems = next;
+    renderKpis(false);
+    renderParcelsAndTabs({ resetBuySellers: wasAllSelected, preserveOpenSellers: true });
+    if (toastMessage) toast(toastMessage, 'success');
+  }
+
+  function restoreRemovalBatch(batchId) {
+    applyRestoreRemovals(r => r.batchId !== batchId, 'Restored removed item(s) to basket.');
+  }
+
+  function restoreRemovalById(id) {
+    const target = state.removedItems.find(r => r.id === id);
+    applyRestoreRemovals(r => r.id !== id, target ? `Restored "${target.item.name}" to ${target.seller}.` : null);
+  }
+
+  function restoreSellerRemovals(seller) {
+    applyRestoreRemovals(r => r.seller !== seller, `Restored removed item(s) from ${seller}.`);
+  }
+
+  function undoLastRemoval() {
+    if (!state.removedItems.length) return;
+    const lastBatchId = state.removedItems[state.removedItems.length - 1].batchId;
+    restoreRemovalBatch(lastBatchId);
+  }
+
+  function restoreAllRemovals() {
+    applyRestoreRemovals(() => false, 'Restored all removed items.');
+  }
+
+  function removeParcelItem(parcelIndex, itemIndex) {
+    if (state.optimising || state.fetching || state.carting) return;
+    const before = activeBasket();
+    const parcel = before?.parcels?.[parcelIndex];
+    const item = parcel?.items?.[itemIndex];
+    if (!parcel || !item) return;
+
+    const batchId = state.removedNextBatchId++;
+    const rec = {
+      id: state.removedNextId++,
+      batchId,
+      seller: parcel.seller,
+      sig: basketItemSignature(parcel.seller, item),
+      item: { ...item },
+    };
+    state.removedItems.push(rec);
+    const after = activeBasket();
+    const delta = Number.isFinite(before.totalCents) && Number.isFinite(after?.totalCents)
+      ? Math.max(0, before.totalCents - after.totalCents)
+      : null;
+    const sellerDropped = parcel.items.length === 1;
+    refreshAfterRemoval({ sellerDroppedAtIndex: sellerDropped ? parcelIndex : -1 });
+
+    const savedTxt = delta !== null && delta > 0 ? ` (-${euros(delta)})` : '';
+    toast(
+      `Removed "${item.name}" from ${parcel.seller}${savedTxt}.`,
+      'default',
+      [
+        {
+          label: 'Copy card',
+          primary: true,
+          keepOpen: true,
+          onClick: btn => copyRemovedRecords([rec], 'plain', btn),
+        },
+        {
+          label: 'Undo',
+          onClick: () => restoreRemovalBatch(batchId),
+        },
+      ],
+    );
+  }
+
+  function removeSellerParcel(parcelIndex) {
+    if (state.optimising || state.fetching || state.carting) return;
+    const before = activeBasket();
+    const parcel = before?.parcels?.[parcelIndex];
+    if (!parcel || !parcel.items.length) return;
+
+    const batchId = state.removedNextBatchId++;
+    const recs = parcel.items.map(item => ({
+      id: state.removedNextId++,
+      batchId,
+      seller: parcel.seller,
+      sig: basketItemSignature(parcel.seller, item),
+      item: { ...item },
+    }));
+    state.removedItems.push(...recs);
+    const after = activeBasket();
+    const delta = Number.isFinite(before.totalCents) && Number.isFinite(after?.totalCents)
+      ? Math.max(0, before.totalCents - after.totalCents)
+      : null;
+    refreshAfterRemoval({ sellerDroppedAtIndex: parcelIndex });
+
+    const count = recs.length;
+    const savedTxt = delta !== null && delta > 0 ? ` (-${euros(delta)})` : '';
+    toast(
+      `Removed ${count} item${count === 1 ? '' : 's'} from ${parcel.seller}${savedTxt}.`,
+      'default',
+      [
+        {
+          label: count === 1 ? 'Copy card' : `Copy ${count} items`,
+          primary: true,
+          keepOpen: true,
+          onClick: btn => copyRemovedRecords(recs, 'plain', btn),
+        },
+        {
+          label: 'Undo',
+          onClick: () => restoreRemovalBatch(batchId),
+        },
+      ],
+    );
+  }
+
+  function renderRemovedItemsBox() {
+    const box = $('removedItemsBox');
+    if (!box) return;
+    if (!state.removedItems.length) {
+      box.innerHTML = '';
+      return;
+    }
+
+    const b = activeBasket();
+    const totalCount = state.removedItems.length;
+    const savedCents = b?.savedByRemovalsCents ?? 0;
+    const entries = removedRecordsToEntries(state.removedItems);
+    const hasMagic = groupExportEntries(entries, 'archidekt').length > 0;
+
+    const bySeller = new Map();
+    for (const rec of state.removedItems) {
+      if (!bySeller.has(rec.seller)) bySeller.set(rec.seller, []);
+      bySeller.get(rec.seller).push(rec);
+    }
+    const sellerGroups = [...bySeller.entries()];
+    const previewNames = state.removedItems.slice(0, 5).map(r => r.item.name);
+    const previewExtra = totalCount > 5 ? ` +${totalCount - 5} more` : '';
+
+    const badgeFor = item => {
+      if (item.kind === 'product') return '<span class="badge badge-product">Product</span>';
+      if (item.kind === 'token') return '<span class="badge badge-token">Token</span>';
+      return `<span class="badge ${item.game === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${item.game === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`;
+    };
+
+    box.innerHTML = `
+      <div class="removed-box">
+        <div class="removed-head">
+          <div class="removed-title">
+            <strong>Removed from basket (${totalCount} item${totalCount === 1 ? '' : 's'})</strong>
+            ${savedCents > 0 ? `<span class="badge badge-combo">-${euros(savedCents)}</span>` : ''}
+            <span style="font-size:12px;color:#92400e">No recompute — remaining sellers unchanged</span>
+          </div>
+          <div class="removed-actions">
+            <button type="button" id="btnCopyRemovedPlain" class="btn btn-primary btn-xs">Copy removed</button>
+            ${hasMagic ? '<button type="button" id="btnCopyRemovedArchidekt" class="btn btn-secondary btn-xs">Copy for Archidekt</button>' : ''}
+            <button type="button" id="btnUndoRemoval" class="btn btn-secondary btn-xs">Undo</button>
+            <button type="button" id="btnRestoreAllRemoved" class="btn btn-link btn-xs">Restore all</button>
+          </div>
+        </div>
+        <details class="removed-details" id="removedItemsDetails" ${state.removedListOpen ? 'open' : ''}>
+          <summary>${esc(previewNames.join(', '))}${esc(previewExtra)} — show individual copy / restore</summary>
+          <div class="removed-groups">
+            ${sellerGroups.map(([seller, recs], gIdx) => `
+              <div class="removed-seller-group">
+                <div class="removed-seller-head">
+                  <div>
+                    <span class="removed-seller-name">${esc(seller)}</span>
+                    <span class="badge badge-neutral" style="margin-left:6px">${recs.length} item${recs.length === 1 ? '' : 's'}</span>
+                  </div>
+                  <div class="removed-item-actions">
+                    <button type="button" class="btn btn-secondary btn-xs" data-copy-removed-seller="${gIdx}">Copy</button>
+                    <button type="button" class="btn btn-link btn-xs" data-restore-removed-seller="${gIdx}">Restore</button>
+                  </div>
+                </div>
+                <div class="removed-seller-items">
+                  ${recs.map(rec => `
+                    <div class="removed-item-row">
+                      <div class="removed-item-info">
+                        ${badgeFor(rec.item)}
+                        <strong>${esc(rec.item.name)}</strong>
+                        ${rec.item.foil ? '<span class="badge badge-indigo">Foil</span>' : ''}
+                        ${rec.item.listName ? `<span style="font-size:11.5px;color:var(--text-muted)">${esc(rec.item.listName)}</span>` : ''}
+                      </div>
+                      <div class="removed-item-actions">
+                        <span class="removed-item-price">${euros(rec.item.priceCents)}</span>
+                        <button type="button" class="btn btn-ghost btn-xs" data-copy-removed-id="${rec.id}">Copy</button>
+                        <button type="button" class="btn btn-link btn-xs" data-restore-removed-id="${rec.id}">Restore</button>
+                      </div>
+                    </div>`).join('')}
+                </div>
+              </div>`).join('')}
+          </div>
+        </details>
+      </div>`;
+
+    $('removedItemsDetails')?.addEventListener('toggle', e => {
+      state.removedListOpen = e.currentTarget.open;
+    });
+    $('btnCopyRemovedPlain')?.addEventListener('click', e => copyRemovedRecords(state.removedItems, 'plain', e.currentTarget));
+    $('btnCopyRemovedArchidekt')?.addEventListener('click', e => copyRemovedRecords(state.removedItems, 'archidekt', e.currentTarget));
+    $('btnUndoRemoval')?.addEventListener('click', undoLastRemoval);
+    $('btnRestoreAllRemoved')?.addEventListener('click', restoreAllRemovals);
+
+    box.querySelectorAll('[data-copy-removed-seller]').forEach(btn => {
+      const [, recs] = sellerGroups[Number(btn.dataset.copyRemovedSeller)] || [];
+      btn.addEventListener('click', () => copyRemovedRecords(recs, 'plain', btn));
+    });
+    box.querySelectorAll('[data-restore-removed-seller]').forEach(btn => {
+      const [seller] = sellerGroups[Number(btn.dataset.restoreRemovedSeller)] || [];
+      btn.addEventListener('click', () => restoreSellerRemovals(seller));
+    });
+    box.querySelectorAll('[data-copy-removed-id]').forEach(btn => {
+      const id = Number(btn.dataset.copyRemovedId);
+      const rec = state.removedItems.find(r => r.id === id);
+      btn.addEventListener('click', () => rec && copyRemovedRecords([rec], 'plain', btn));
+    });
+    box.querySelectorAll('[data-restore-removed-id]').forEach(btn => {
+      const id = Number(btn.dataset.restoreRemovedId);
+      btn.addEventListener('click', () => restoreRemovalById(id));
+    });
+  }
+
+  function renderParcelsAndTabs({ resetBuySellers = true, preserveOpenSellers = false } = {}) {
     const b = activeBasket();
     if (!b) return;
+    const openSellers = preserveOpenSellers
+      ? new Set(
+          [...$('parcelsList').querySelectorAll('details.parcel-card[open]')]
+            .map(el => el.dataset.seller)
+            .filter(Boolean)
+        )
+      : null;
+
     const maxSellers = Math.max(1, b.parcels.length);
-    $('buySellers').max = maxSellers;
-    if (resetBuySellers || !Number($('buySellers').value)) {
+    $('buySellers').min = b.parcels.length ? 1 : 0;
+    $('buySellers').max = b.parcels.length ? maxSellers : 0;
+    if (!b.parcels.length) {
+      $('buySellers').value = 0;
+    } else if (resetBuySellers || !Number($('buySellers').value)) {
       $('buySellers').value = b.parcels.length;
     } else {
       $('buySellers').value = Math.min(maxSellers, Math.max(1, Number($('buySellers').value)));
     }
     updateBuySummary();
+    renderRemovedItemsBox();
 
     // Missing items
     const reasons = {
@@ -1105,61 +1466,82 @@
     }).join('');
 
     // Seller parcels
-    $('parcelsList').innerHTML = b.parcels.map((p, idx) => {
-      const badges = [];
-      if (p.location) badges.push(`<span class="badge badge-neutral">${esc(p.location)}</span>`);
-      const games = p.games || [];
-      if (games.length > 1) badges.push('<span class="badge badge-combo">MTG + YGO combined</span>');
-      else if (games[0]) badges.push(`<span class="badge ${games[0] === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${games[0] === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`);
-      if (p.hasProducts) badges.push('<span class="badge badge-product">+ Product</span>');
-      if (p.hasTokens) badges.push(`<span class="badge badge-token">+${p.tokenCount} token${p.tokenCount === 1 ? '' : 's'}</span>`);
+    if (!b.parcels.length) {
+      $('parcelsList').innerHTML = '<div class="alert-banner alert-info"><div>All sellers were removed from this basket. Copy your removed cards or click <strong>Restore all</strong> above to bring them back.</div></div>';
+    } else {
+      $('parcelsList').innerHTML = b.parcels.map((p, idx) => {
+        const badges = [];
+        if (p.location) badges.push(`<span class="badge badge-neutral">${esc(p.location)}</span>`);
+        const games = p.games || [];
+        if (games.length > 1) badges.push('<span class="badge badge-combo">MTG + YGO combined</span>');
+        else if (games[0]) badges.push(`<span class="badge ${games[0] === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${games[0] === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`);
+        if (p.hasProducts) badges.push('<span class="badge badge-product">+ Product</span>');
+        if (p.hasTokens) badges.push(`<span class="badge badge-token">+${p.tokenCount} token${p.tokenCount === 1 ? '' : 's'}</span>`);
+        const isOpen = openSellers ? openSellers.has(p.seller) : idx < 3;
 
-      return `
-        <details class="parcel-card" ${idx < 3 ? 'open' : ''}>
-          <summary class="parcel-summary">
-            <div class="parcel-left">
-              <span class="parcel-chevron" aria-hidden="true">▸</span>
-              <span class="parcel-rank">#${idx + 1}</span>
-              <span class="parcel-seller">${esc(p.seller)}</span>
-              ${badges.join('')}
-              <span class="badge badge-neutral">${p.items.length} item${p.items.length === 1 ? '' : 's'}</span>
+        return `
+          <details class="parcel-card" data-seller="${esc(p.seller)}" ${isOpen ? 'open' : ''}>
+            <summary class="parcel-summary">
+              <div class="parcel-left">
+                <span class="parcel-chevron" aria-hidden="true">▸</span>
+                <span class="parcel-rank">#${idx + 1}</span>
+                <span class="parcel-seller">${esc(p.seller)}</span>
+                ${badges.join('')}
+                <span class="badge badge-neutral">${p.items.length} item${p.items.length === 1 ? '' : 's'}</span>
+              </div>
+              <div class="parcel-right">
+                <span class="parcel-cost">${euros(p.itemsCents)}</span>
+                <span class="parcel-ship">+ ${euros(p.shippingCents)} ${esc(p.method || '')}</span>
+                <strong>${euros(p.itemsCents + p.shippingCents)}</strong>
+                <button type="button" class="btn btn-ghost btn-xs parcel-remove-btn" data-remove-parcel="${idx}" title="Remove all ${p.items.length} item${p.items.length === 1 ? '' : 's'} from ${esc(p.seller)} (no recompute)">Remove seller</button>
+              </div>
+            </summary>
+            <div class="parcel-items-wrap">
+              <table class="data-table">
+                <thead><tr><th>Item</th><th>Source</th><th class="num">Price</th><th class="num">Market</th><th class="col-action"></th></tr></thead>
+                <tbody>
+                  ${p.items.map((item, itemIdx) => `
+                    <tr>
+                      <td>
+                        <strong>${esc(item.name)}</strong>
+                        ${item.foil ? '<span class="badge badge-indigo">Foil</span>' : ''}
+                        ${item.aboveMarket ? '<span class="badge badge-warn">above market</span>' : ''}
+                        ${item.kind === 'token' && item.tokenCovers?.length ? `<span class="token-covers-sub">Covers: ${esc(item.tokenCovers.join(' + '))}</span>` : ''}
+                      </td>
+                      <td>
+                        ${item.kind === 'product'
+                          ? '<span class="badge badge-product">Product</span>'
+                          : item.kind === 'token'
+                            ? `<span class="badge badge-token">Token</span>${item.tokenCombo ? ' <span class="badge badge-token-combo">2-in-1</span>' : ''}`
+                            : `<span class="badge ${item.game === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${item.game === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`}
+                        ${item.listName ? `<span style="font-size:12px;color:var(--text-muted)">${esc(item.listName)}</span>` : ''}
+                      </td>
+                      <td class="num"><strong>${euros(item.priceCents)}</strong></td>
+                      <td class="num" style="color:var(--text-muted)">${euros(item.targetCents)}</td>
+                      <td class="col-action">
+                        <button type="button" class="btn-icon-remove" data-remove-item-parcel="${idx}" data-remove-item-idx="${itemIdx}" title="Remove ${esc(item.name)} from ${esc(p.seller)} (no recompute)" aria-label="Remove ${esc(item.name)}">&times;</button>
+                      </td>
+                    </tr>`).join('')}
+                </tbody>
+              </table>
             </div>
-            <div class="parcel-right">
-              <span class="parcel-cost">${euros(p.itemsCents)}</span>
-              <span class="parcel-ship">+ ${euros(p.shippingCents)} ${esc(p.method || '')}</span>
-              <strong>${euros(p.itemsCents + p.shippingCents)}</strong>
-            </div>
-          </summary>
-          <div class="parcel-items-wrap">
-            <table class="data-table">
-              <thead><tr><th>Item</th><th>Source</th><th class="num">Price</th><th class="num">Market</th></tr></thead>
-              <tbody>
-                ${p.items.map(item => `
-                  <tr>
-                    <td>
-                      <strong>${esc(item.name)}</strong>
-                      ${item.foil ? '<span class="badge badge-indigo">Foil</span>' : ''}
-                      ${item.aboveMarket ? '<span class="badge badge-warn">above market</span>' : ''}
-                      ${item.kind === 'token' && item.tokenCovers?.length ? `<span class="token-covers-sub">Covers: ${esc(item.tokenCovers.join(' + '))}</span>` : ''}
-                    </td>
-                    <td>
-                      ${item.kind === 'product'
-                        ? '<span class="badge badge-product">Product</span>'
-                        : item.kind === 'token'
-                          ? `<span class="badge badge-token">Token</span>${item.tokenCombo ? ' <span class="badge badge-token-combo">2-in-1</span>' : ''}`
-                          : `<span class="badge ${item.game === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${item.game === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`}
-                      ${item.listName ? `<span style="font-size:12px;color:var(--text-muted)">${esc(item.listName)}</span>` : ''}
-                    </td>
-                    <td class="num"><strong>${euros(item.priceCents)}</strong></td>
-                    <td class="num" style="color:var(--text-muted)">${euros(item.targetCents)}</td>
-                  </tr>`).join('')}
-              </tbody>
-            </table>
-          </div>
-        </details>`;
-    }).join('');
+          </details>`;
+      }).join('');
+    }
     $('parcelsList').querySelectorAll('details.parcel-card').forEach(card => {
       card.addEventListener('toggle', updateSellerCollapseControls);
+    });
+    $('parcelsList').querySelectorAll('[data-remove-parcel]').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        removeSellerParcel(Number(btn.dataset.removeParcel));
+      });
+    });
+    $('parcelsList').querySelectorAll('[data-remove-item-parcel]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        removeParcelItem(Number(btn.dataset.removeItemParcel), Number(btn.dataset.removeItemIdx));
+      });
     });
     updateSellerCollapseControls();
 
@@ -1240,6 +1622,8 @@
     const col = state.collection;
     if (!col) return;
     const myJob = ++state.optimiseJobId;
+    state.removedItems = [];
+    state.removedListOpen = false;
     state.optimising = true;
     syncBusyUI();
     $('emptyState').hidden = true;
@@ -1673,7 +2057,7 @@
 
   function basketEntries() {
     const b = activeBasket();
-    if (!b) return [];
+    if (!b || !b.parcels.length) return [];
     const n = Math.max(1, Number($('buySellers').value) || b.parcels.length);
     return collectBasketEntries(b.parcels.slice(0, n));
   }
@@ -1687,6 +2071,7 @@
     const entries = basketEntries();
     const archGroups = groupExportEntries(entries, 'archidekt');
     const plainGroups = groupExportEntries(entries, 'plain');
+    $('btnCopyPlain').disabled = entries.length === 0;
     $('btnCopyArchidekt').hidden = archGroups.length === 0;
     $('btnCopyArchidekt').textContent = archGroups.length > 1 ? 'Export for Archidekt ▾' : 'Copy for Archidekt';
     $('btnCopyPlain').textContent = plainGroups.length > 1 ? 'Export list ▾' : 'Copy list';
@@ -1950,7 +2335,7 @@
 
   async function addToCart() {
     const b = activeBasket();
-    if (!b || state.fetching || state.fetchingTokens || state.carting || state.optimising) return;
+    if (!b || !b.parcels.length || state.fetching || state.fetchingTokens || state.carting || state.optimising) return;
     const n = Math.max(1, Number($('buySellers').value) || b.parcels.length);
     const parcels = b.parcels.slice(0, n);
     const { key: cartKey, added } = await alreadyAdded();
@@ -2066,9 +2451,16 @@
 
   function selectedBasketParcels() {
     if (!state.basket?.parcels?.length) return [];
-    const max = state.basket.parcels.length;
+    const base = state.removedItems.length
+      ? applyBasketRemovals(state.basket, state.removedItems, {
+          tables: state.currentTables,
+          trackedOnly: Object.keys(state.trackedSellers),
+        })
+      : state.basket;
+    if (!base.parcels.length) return [];
+    const max = base.parcels.length;
     const n = Math.min(max, Math.max(1, Number($('buySellers').value) || max));
-    return state.basket.parcels.slice(0, n);
+    return base.parcels.slice(0, n);
   }
 
   function renderTokenDeckToggles(decks) {
