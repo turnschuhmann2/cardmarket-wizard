@@ -230,17 +230,29 @@
   function offersBySeller(collection) {
     const sellers = new Map();
     const sellerLocations = new Map();
+    const sellerMeta = new Map();
     for (const result of collection.results) {
       for (const offer of result.offers) {
         if (!sellers.has(offer.seller)) sellers.set(offer.seller, new Map());
         if (offer.location && !sellerLocations.has(offer.seller)) sellerLocations.set(offer.seller, offer.location);
+        if (offer.rating || offer.reputation != null || offer.sellerType != null || typeof offer.professional === 'boolean') {
+          let meta = sellerMeta.get(offer.seller);
+          if (!meta) {
+            meta = { rating: null, reputation: null, sellerType: null, professional: null };
+            sellerMeta.set(offer.seller, meta);
+          }
+          if (offer.rating && !meta.rating) meta.rating = offer.rating;
+          if (offer.reputation != null && meta.reputation == null) meta.reputation = offer.reputation;
+          if (typeof offer.sellerType === 'number' && meta.sellerType == null) meta.sellerType = offer.sellerType;
+          if (typeof offer.professional === 'boolean' && meta.professional == null) meta.professional = offer.professional;
+        }
         const byKey = sellers.get(offer.seller);
         if (!byKey.has(result.key)) byKey.set(result.key, []);
         byKey.get(result.key).push(offer);
       }
     }
     for (const byKey of sellers.values()) for (const list of byKey.values()) list.sort((a, b) => a.priceCents - b.priceCents);
-    return { sellers, sellerLocations };
+    return { sellers, sellerLocations, sellerMeta };
   }
 
   // Normalises either a single shipping table (Method[]) or a per-country table map
@@ -276,7 +288,7 @@
     };
 
     const units = unitsOf(collection);
-    const { sellers, sellerLocations } = offersBySeller(collection);
+    const { sellers, sellerLocations, sellerMeta } = offersBySeller(collection);
     const unitById = new Map(units.map(unit => [unit.id, unit]));
 
     const uniqueLocations = [...new Set([...sellerLocations.values()].filter(Boolean))];
@@ -319,8 +331,13 @@
       return [...bySeller].map(([seller, items]) => {
         const itemsCents = items.reduce((sum, item) => sum + item.offer.priceCents, 0);
         const method = parcelShipping(tableFor(seller), items, itemsCents);
+        const meta = sellerMeta.get(seller);
         return {
           seller, location: sellerLocations.get(seller) || null,
+          ...(meta?.rating ? { rating: meta.rating } : {}),
+          ...(meta?.reputation != null ? { reputation: meta.reputation } : {}),
+          ...(meta?.sellerType != null ? { sellerType: meta.sellerType } : {}),
+          ...(meta?.professional != null ? { professional: meta.professional } : {}),
           items, itemsCents, method, shippingCents: method ? method.priceCents : Infinity,
         };
       });
@@ -825,6 +842,10 @@
         const hasProducts = parcel.items.some(item => item.unit.kind === 'product');
         return {
           seller: parcel.seller, location: parcel.location, games, hasProducts,
+          ...(parcel.rating ? { rating: parcel.rating } : {}),
+          ...(parcel.reputation != null ? { reputation: parcel.reputation } : {}),
+          ...(parcel.sellerType != null ? { sellerType: parcel.sellerType } : {}),
+          ...(parcel.professional != null ? { professional: parcel.professional } : {}),
           itemsCents: parcel.itemsCents, shippingCents: parcel.shippingCents,
           method: parcel.method?.name ?? null, extraPerCardCents: Math.round(extraCents / parcel.items.length),
           items: parcel.items.map(({ unit, offer }) => ({
@@ -899,6 +920,11 @@
         const row = { seller, cards: byKey.size, atTarget, cheapestCents };
         const loc = sellerLocations.get(seller);
         if (loc) row.location = loc;
+        const meta = sellerMeta.get(seller);
+        if (meta?.rating) row.rating = meta.rating;
+        if (meta?.reputation != null) row.reputation = meta.reputation;
+        if (meta?.sellerType != null) row.sellerType = meta.sellerType;
+        if (meta?.professional != null) row.professional = meta.professional;
         if (games.size) row.games = [...games];
         return row;
       }).sort((a, b) => b.cards - a.cards || b.atTarget - a.atTarget || a.cheapestCents - b.cheapestCents).slice(0, limit);

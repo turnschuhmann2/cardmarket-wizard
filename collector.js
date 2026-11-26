@@ -27,7 +27,130 @@
   const CONDITION_CODES = ['MT', 'NM', 'EX', 'GD', 'LP', 'PL', 'PO'];
   // Private, professional, powerseller. Verified: the three filters partition a printing's offers.
   const SELLER_TYPES = [0, 1, 2];
+  // Cardmarket seller reputation thresholds (URL param `sellerReputation`):
+  // 1 = Outstanding (>=36 evals, >=97% very good)
+  // 2 = Very good   (>=36 evals, >=92% very good)
+  // 3 = Good        (>=6 evals, <=4% neutral, <=2% bad)
+  // 4 = Average     (excludes Bad & unrated/new sellers)
+  // 5 = Bad         (unfiltered / any seller, including unrated)
+  const SELLER_REPUTATIONS = {
+    outstanding: 1,
+    'very-good': 2,
+    good: 3,
+    average: 4,
+    bad: 5,
+  };
+  const SELLER_REPUTATION_LABELS = {
+    1: 'Outstanding',
+    2: 'Very good',
+    3: 'Good',
+    4: 'Average',
+    5: 'Bad',
+  };
+  const SELLER_TYPE_LABELS = {
+    0: 'Private',
+    1: 'Professional',
+    2: 'Powerseller',
+  };
   const CACHE_MAX_AGE_MS = 8 * 60 * 60 * 1000;
+
+  function normalizeSellerReputation(value) {
+    if (value == null || value === '') return null;
+    if (typeof value === 'string') {
+      const key = value.trim().toLowerCase().replace(/[\s_]+/g, '-');
+      if (key === 'verygood') return 2;
+      if (key in SELLER_REPUTATIONS) return SELLER_REPUTATIONS[key] < 5 ? SELLER_REPUTATIONS[key] : null;
+    }
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 1 || n >= 5) return null;
+    return n;
+  }
+
+  function normalizeSellerTypes(value) {
+    if (value == null || value === '') return null;
+    const raw = Array.isArray(value)
+      ? value
+      : typeof value === 'string'
+        ? value.split(',')
+        : [value];
+    const valid = [...new Set(raw.map(Number).filter(n => SELLER_TYPES.includes(n)))].sort((a, b) => a - b);
+    if (!valid.length || valid.length === SELLER_TYPES.length) return null;
+    return valid;
+  }
+
+  function offerReputationRank(offer) {
+    if (!offer) return null;
+    if (typeof offer.reputation === 'number' && Number.isInteger(offer.reputation) && offer.reputation >= 1 && offer.reputation <= 5) {
+      return offer.reputation;
+    }
+    if (typeof offer.rating === 'string' && offer.rating) {
+      const key = offer.rating.trim().toLowerCase().replace(/[\s_]+/g, '-');
+      if (key === 'verygood') return 2;
+      if (key in SELLER_REPUTATIONS) return SELLER_REPUTATIONS[key];
+    }
+    return null;
+  }
+
+  function offerSellerType(offer) {
+    if (!offer) return null;
+    if (typeof offer.sellerType === 'number' && SELLER_TYPES.includes(offer.sellerType)) return offer.sellerType;
+    return null;
+  }
+
+  function matchesSellerFilter(offer, filter = {}) {
+    if (!filter) return true;
+    const minRep = normalizeSellerReputation(filter.sellerReputation ?? filter.minReputation);
+    if (minRep != null) {
+      const rank = offerReputationRank(offer);
+      if (rank === null || rank > minRep) return false;
+    }
+    const allowedTypes = filter.sellerTypes != null
+      ? normalizeSellerTypes(filter.sellerTypes)
+      : (filter.sellerType !== undefined && filter.sellerType !== null ? normalizeSellerTypes(filter.sellerType) : null);
+    if (allowedTypes) {
+      const st = offerSellerType(offer);
+      if (st !== null) {
+        if (!allowedTypes.includes(st)) return false;
+      } else if (typeof offer?.professional === 'boolean') {
+        if (!offer.professional && !allowedTypes.includes(0)) return false;
+        if (offer.professional && !allowedTypes.includes(1) && !allowedTypes.includes(2)) return false;
+      }
+    }
+    return true;
+  }
+
+  function parseSellerRating(row, sellerTips = []) {
+    const icon = row.querySelector?.('[class*="fonticon-seller-rating-"]');
+    const clsMatch = /fonticon-seller-rating-([a-z0-9-]+)/i.exec(icon?.className || '');
+    if (clsMatch) {
+      const raw = clsMatch[1].toLowerCase();
+      if (raw === 'verygood' || raw === 'very-good') return 'very-good';
+      if (raw in SELLER_REPUTATIONS) return raw;
+      if (/not|none|unrated|unknown|new/.test(raw)) return null;
+    }
+    for (const text of sellerTips) {
+      const t = String(text || '').trim();
+      if (!t) continue;
+      if (/\boutstanding\b/i.test(t)) return 'outstanding';
+      if (/\bvery[\s-]+good\b/i.test(t)) return 'very-good';
+      if (/\bgood\s+seller\b|^good$/i.test(t)) return 'good';
+      if (/\baverage\s+seller\b|^average$/i.test(t)) return 'average';
+      if (/\bbad\s+seller\b|^bad$/i.test(t)) return 'bad';
+    }
+    return null;
+  }
+
+  function parseSellerType(sellerTips = []) {
+    for (const text of sellerTips) {
+      const t = String(text || '').trim();
+      if (/\bpowerseller\b/i.test(t)) return 2;
+    }
+    for (const text of sellerTips) {
+      const t = String(text || '').trim();
+      if (/\bprofessional\b/i.test(t)) return 1;
+    }
+    return 0;
+  }
 
   class RetryableError extends Error {}
   class BlockedError extends Error {}
@@ -85,13 +208,16 @@
     if (!sellerLink || !location || !condition || !language || !price || !quantity) {
       throw new Error(`Unreadable offer row ${row.id}`);
     }
-    const rating = /fonticon-seller-rating-([a-z-]+)/.exec(row.querySelector('[class*="fonticon-seller-rating-"]')?.className || '');
+    const rating = parseSellerRating(row, sellerTips);
+    const sellerType = parseSellerType(sellerTips);
     return {
       idArticle: Number(row.id.replace('articleRow', '')),
       seller: sellerLink.textContent.trim(),
       location: location.slice('Item location: '.length).trim(),
-      professional: sellerTips.includes('Professional') || sellerTips.includes('Powerseller'),
-      rating: rating ? rating[1] : null,
+      professional: sellerType >= 1,
+      sellerType,
+      rating,
+      reputation: offerReputationRank({ rating }),
       condition: CONDITIONS[condition],
       language: LANGUAGES[language],
       foil: attributes.includes('Foil'),
@@ -135,13 +261,16 @@
       if (amounts.length >= 2) shippingCents = amounts[1];
     }
 
-    const rating = /fonticon-seller-rating-([a-z-]+)/.exec(row.querySelector('[class*="fonticon-seller-rating-"]')?.className || '');
+    const rating = parseSellerRating(row, sellerTips);
+    const sellerType = parseSellerType(sellerTips);
     return {
       idArticle: Number(row.id.replace('articleRow', '')),
       seller: sellerLink.textContent.trim(),
       location: location.slice('Item location: '.length).trim(),
-      professional: sellerTips.includes('Professional') || sellerTips.includes('Powerseller'),
-      rating: rating ? rating[1] : null,
+      professional: sellerType >= 1,
+      sellerType,
+      rating,
+      reputation: offerReputationRank({ rating }),
       condition: condition ? CONDITIONS[condition] : 2,
       language: language ? LANGUAGES[language] : null,
       foil: false,
@@ -172,7 +301,12 @@
     for (const [name, value] of [['isFoil', query.foil], ['isSigned', query.signed], ['isAltered', query.altered]]) {
       if (value && value !== 'any') params.set(name, value);
     }
-    if (query.sellerType !== undefined) params.set('sellerType', query.sellerType);
+    if (query.sellerType !== undefined && query.sellerType !== null) {
+      const st = Array.isArray(query.sellerType) ? query.sellerType : [query.sellerType];
+      if (st.length) params.set('sellerType', st.join(','));
+    }
+    const minRep = normalizeSellerReputation(query.sellerReputation ?? query.minReputation);
+    if (minRep != null) params.set('sellerReputation', String(minRep));
     if (query.expansions?.length) params.set('idExpansion', query.expansions.join(','));
     return params.toString();
   }
@@ -193,7 +327,19 @@
     }
     const conditions = echo.condition || CONDITION_CODES;
     if (query.minCondition != null && conditions.join() !== CONDITION_CODES.slice(0, query.minCondition).join()) problems.push('condition');
-    if (query.sellerType !== undefined && (echo.sellerStatus || []).join() !== String(query.sellerType)) problems.push('seller type');
+    if (query.sellerType !== undefined && query.sellerType !== null) {
+      const wantTypes = (Array.isArray(query.sellerType) ? query.sellerType : String(query.sellerType).split(','))
+        .map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+      const echoTypes = (Array.isArray(echo.sellerStatus)
+        ? echo.sellerStatus
+        : echo.sellerStatus && typeof echo.sellerStatus === 'object'
+          ? Object.keys(echo.sellerStatus)
+          : echo.sellerStatus != null && echo.sellerStatus !== ''
+            ? String(echo.sellerStatus).split(',')
+            : [])
+        .map(Number).filter(Number.isFinite).sort((a, b) => a - b);
+      if (wantTypes.length && echoTypes.join() !== wantTypes.join()) problems.push('seller type');
+    }
     if (query.expansions?.length &&
         Object.keys(echo.idExpansions || {}).map(Number).sort((a, b) => a - b).join() !== [...query.expansions].sort((a, b) => a - b).join()) {
       problems.push('expansion');
@@ -531,7 +677,7 @@
       throw new Error(`Cardmarket answered without a result code: ${clean}`);
     }
 
-    // Card-page rows; unreadable ones are skipped and counted rather than failing the card.
+    // Card-page rows; unreadable or filtered-out ones are skipped and counted rather than failing the card.
     function cardRows(rows, query) {
       const offers = [];
       let skipped = 0;
@@ -539,6 +685,7 @@
         try {
           const offer = { ...parseOfferRow(row), idProduct: productOf(row) };
           checkOffer(offer, query);
+          if (!matchesSellerFilter(offer, query)) { skipped += 1; continue; }
           offers.push(offer);
         } catch (error) {
           skipped += 1;
@@ -548,11 +695,14 @@
     }
 
     function rowsFrom(container, query) {
-      return [...container.querySelectorAll('.article-row[id^="articleRow"]')].map(row => {
+      const out = [];
+      for (const row of container.querySelectorAll('.article-row[id^="articleRow"]')) {
         const offer = parseOfferRow(row);
         checkOffer(offer, query);
-        return offer;
-      });
+        if (!matchesSellerFilter(offer, query)) continue;
+        out.push(offer);
+      }
+      return out;
     }
 
     return {
@@ -666,6 +816,7 @@
             const offer = { ...parseProductOfferRow(row), idProduct: meta.idProduct };
             if (query.language != null && offer.language !== null && offer.language !== query.language) continue;
             if (query.minCondition != null && query.minCondition < 7 && offer.condition > query.minCondition) continue;
+            if (!matchesSellerFilter(offer, query)) { skipped += 1; continue; }
             offers.push(offer);
           } catch (error) {
             skipped += 1;
@@ -1103,27 +1254,50 @@
     };
   }
 
-  const cacheKey = query => [query.game || 'Magic', query.idProduct, query.language ?? '', [...(query.sellerCountries || [])].sort().join('.'), query.minCondition ?? '',
-    query.foil ?? 'any', query.signed ?? 'any', query.altered ?? 'any', query.sellerType ?? ''].join('|');
+  const cacheKey = query => {
+    const st = Array.isArray(query.sellerType) ? query.sellerType.join('.') : (query.sellerType ?? '');
+    const rep = normalizeSellerReputation(query.sellerReputation ?? query.minReputation);
+    const base = [query.game || 'Magic', query.idProduct, query.language ?? '', [...(query.sellerCountries || [])].sort().join('.'), query.minCondition ?? '',
+      query.foil ?? 'any', query.signed ?? 'any', query.altered ?? 'any', st].join('|');
+    return rep != null ? `${base}|r${rep}` : base;
+  };
+
+  const productCacheKey = (pathOrUrl, language, countriesStr, minCondition, sellerReputation, sellerTypes) => {
+    const base = ['product', pathOrUrl, language ?? '', countriesStr, minCondition].join('|');
+    const rep = normalizeSellerReputation(sellerReputation);
+    const st = normalizeSellerTypes(sellerTypes);
+    if (rep == null && !st) return base;
+    return `${base}|r${rep ?? ''}|t${st ? st.join('.') : ''}`;
+  };
 
   async function collect(plan, site, options = {}) {
     const {
       targetCopies = 5, targetSellers = 3, cutoffFactor = 2, cutoffMarginCents = 50, sellerCountries = [7],
+      minReputation = null, sellerReputation = null, sellerTypes = null,
       concurrency = 4, entryConcurrency = 4, intervalMs = 400, wave = 4,
       onProgress = () => {}, log = () => {}, cache = null, cacheMaxAgeMs = CACHE_MAX_AGE_MS,
     } = options;
+    const minRep = normalizeSellerReputation(minReputation ?? sellerReputation);
+    const allowedSellerTypes = normalizeSellerTypes(sellerTypes);
+    const initialSellerType = allowedSellerTypes
+      ? (allowedSellerTypes.length === 1 ? allowedSellerTypes[0] : allowedSellerTypes)
+      : undefined;
+    const sellerFilter = { sellerReputation: minRep, sellerTypes: allowedSellerTypes };
     const runner = createRunner(site, options);
     const { call, stats } = runner;
     log({ type: 'run-start', cards: plan.entries.length, printings: plan.entries.reduce((sum, entry) => sum + (entry.printings?.length || 0), 0),
-      sellerCountries, intervalMs, concurrency, entryConcurrency, targetCopies, targetSellers, cutoffFactor, cutoffMarginCents });
+      sellerCountries, minReputation: minRep, sellerTypes: allowedSellerTypes,
+      intervalMs, concurrency, entryConcurrency, targetCopies, targetSellers, cutoffFactor, cutoffMarginCents });
 
     async function collectEntry(entry) {
       if (entry.kind === 'product') {
         const query = {
           game: entry.game || 'Magic', language: entry.languages?.length === 1 ? entry.languages[0] : null,
           sellerCountries, minCondition: entry.minCondition ?? 7,
+          ...(minRep != null ? { sellerReputation: minRep } : {}),
+          ...(initialSellerType !== undefined ? { sellerType: initialSellerType } : {}),
         };
-        const pKey = ['product', entry.productPath || entry.url, query.language ?? '', [...sellerCountries].sort().join('.'), query.minCondition].join('|');
+        const pKey = productCacheKey(entry.productPath || entry.url, query.language, [...sellerCountries].sort().join('.'), query.minCondition, minRep, allowedSellerTypes);
         const hit = cache?.get(pKey);
         let page;
         if (hit && Date.now() - hit.at < cacheMaxAgeMs) {
@@ -1147,7 +1321,9 @@
             };
           }
         }
-        const sorted = [...page.offers].sort((a, b) => (a.priceCents + (a.shippingCents || 0)) - (b.priceCents + (b.shippingCents || 0)));
+        const sorted = [...page.offers]
+          .filter(offer => matchesSellerFilter(offer, sellerFilter))
+          .sort((a, b) => (a.priceCents + (a.shippingCents || 0)) - (b.priceCents + (b.shippingCents || 0)));
         const target = targetPrice(sorted, entry.amount, targetCopies, targetSellers) ?? sorted[0]?.priceCents ?? null;
         return {
           key: entry.key, name: page.meta?.name || entry.name, amount: entry.amount,
@@ -1167,7 +1343,10 @@
           queries.push({
             game: entry.game || 'Magic', idProduct: printing.idProduct, guideLowCents: printing.guideLowCents ?? null, language,
             sellerCountries, minCondition: entry.minCondition, foil: entry.foil, signed: entry.signed,
-            altered: entry.altered, status: 'pending', pages: 0, lastPriceCents: null, cursor: null, error: null,
+            altered: entry.altered,
+            ...(minRep != null ? { sellerReputation: minRep } : {}),
+            ...(initialSellerType !== undefined ? { sellerType: initialSellerType } : {}),
+            status: 'pending', pages: 0, lastPriceCents: null, cursor: null, error: null,
           });
         }
       }
@@ -1194,6 +1373,7 @@
       function keep(query, list) {
         for (const offer of list) {
           if (entry.maxPriceCents != null && offer.priceCents > entry.maxPriceCents) continue;
+          if (!matchesSellerFilter(offer, sellerFilter)) continue;
           offers.set(offer.idArticle, { ...offer, idProduct: query.idProduct });
         }
       }
@@ -1249,9 +1429,11 @@
       for (;;) {
         const limit = cutoff();
         for (const query of queries) {
-          if (query.status === 'capped' && query.lastPriceCents <= limit && query.sellerType === undefined) {
+          const canSplitSellerType = query.sellerType === undefined || (Array.isArray(query.sellerType) && query.sellerType.length > 1);
+          if (query.status === 'capped' && query.lastPriceCents <= limit && canSplitSellerType) {
+            const splitTypes = Array.isArray(query.sellerType) ? query.sellerType : SELLER_TYPES;
             query.status = 'split';
-            for (const sellerType of SELLER_TYPES) {
+            for (const sellerType of splitTypes) {
               queries.push({ ...query, sellerType, status: 'pending', pages: 0, lastPriceCents: null, cursor: null, cachedAt: null });
             }
           }
@@ -1328,6 +1510,7 @@
     const order = new Map(plan.entries.map((entry, index) => [entry.key, index]));
     results.sort((a, b) => order.get(a.key) - order.get(b.key));
     return { results, stats, blocked: runner.blocked()?.message ?? null, sellerCountries,
+      sellerFilter: { minReputation: minRep, sellerTypes: allowedSellerTypes },
       rule: { targetCopies, targetSellers, cutoffFactor, cutoffMarginCents } };
   }
 
@@ -1393,6 +1576,7 @@
     const {
       listId = null, lists = null,
       targetCopies = 5, targetSellers = 3, cutoffFactor = 2, cutoffMarginCents = 50, sellerCountries = [7],
+      minReputation = null, sellerReputation = null, sellerTypes = null,
       domesticCountry = null, domesticLocation = null,
       domesticMinOffers = 10, domesticProductMinOffers = 15, domesticPageFullThreshold = 45,
       domesticSellerShare = 0.6,
@@ -1414,7 +1598,19 @@
         ? [{ game: plan.entries.find(e => e.kind !== 'product')?.game || 'Magic', listId }]
         : [];
 
+    const minRep = normalizeSellerReputation(minReputation ?? sellerReputation);
+    const allowedSellerTypes = normalizeSellerTypes(sellerTypes);
+    const sellerFilter = { sellerReputation: minRep, sellerTypes: allowedSellerTypes };
+    const productSellerType = allowedSellerTypes
+      ? (allowedSellerTypes.length === 1 ? allowedSellerTypes[0] : allowedSellerTypes)
+      : undefined;
+    const sellerTypeQueries = splitBySellerType
+      ? (allowedSellerTypes || SELLER_TYPES)
+      : (allowedSellerTypes ? [productSellerType] : [undefined]);
+    const repKeySuffix = minRep != null ? `|r${minRep}` : '';
+
     log({ type: 'run-start', method: 'sellers', cards: plan.entries.length, lists: activeLists.length, sellerCountries,
+      minReputation: minRep, sellerTypes: allowedSellerTypes,
       minSellers, sellerBatch, sellerLimit, improvementCents, minSellerCards, maxSellerPages, concurrency: slotSize,
       intervalMs: runner.pace.intervalMs, targetCopies, targetSellers, cutoffFactor, cutoffMarginCents, splitBySellerType, groupSkipFactor, expansionGroupSize });
 
@@ -1456,11 +1652,35 @@
     }
     const offers = new Map(entries.map(entry => [entry.key, new Map()]));
     const sellerLocations = new Map();
+    const sellerMeta = new Map();
+    const rememberSellerMeta = offer => {
+      if (!offer?.seller) return;
+      let meta = sellerMeta.get(offer.seller);
+      if (!meta) {
+        meta = { location: null, rating: null, reputation: null, sellerType: null, professional: null };
+        sellerMeta.set(offer.seller, meta);
+      }
+      if (offer.location && !meta.location) meta.location = offer.location;
+      if (offer.location && !sellerLocations.has(offer.seller)) sellerLocations.set(offer.seller, offer.location);
+      const rank = offerReputationRank(offer);
+      if (rank != null && meta.reputation == null) {
+        meta.reputation = rank;
+        meta.rating = offer.rating || Object.entries(SELLER_REPUTATIONS).find(([, r]) => r === rank)?.[0] || null;
+      }
+      const st = offerSellerType(offer);
+      if (st != null && meta.sellerType == null) {
+        meta.sellerType = st;
+        meta.professional = st >= 1;
+      } else if (typeof offer.professional === 'boolean' && meta.professional == null) {
+        meta.professional = offer.professional;
+      }
+    };
     const cardState = new Map(entries.map(entry => [entry.key,
       { status: 'pending', cardOffers: 0, skipped: 0, pages: 0, groups: 0, groupsSkipped: 0, error: null, resolvedName: null, resolvedMeta: null }]));
 
     const keep = (entry, offer) => {
-      if (offer.location && !sellerLocations.has(offer.seller)) sellerLocations.set(offer.seller, offer.location);
+      if (!matchesSellerFilter(offer, sellerFilter)) return false;
+      rememberSellerMeta(offer);
       if (entry.kind === 'product') {
         if (!matchesWant(entry, offer)) return false;
         offers.get(entry.key).set(offer.idArticle, offer);
@@ -1511,8 +1731,10 @@
             language: entry.languages?.length === 1 ? entry.languages[0] : null,
             sellerCountries,
             minCondition: entry.minCondition ?? 7,
+            ...(minRep != null ? { sellerReputation: minRep } : {}),
+            ...(productSellerType !== undefined ? { sellerType: productSellerType } : {}),
           };
-          const key = ['product', entry.productPath || entry.url, query.language ?? '', countriesKey, query.minCondition].join('|');
+          const key = productCacheKey(entry.productPath || entry.url, query.language, countriesKey, query.minCondition, minRep, allowedSellerTypes);
           const page = await cached(key, () => call('productPage', entry, query));
           let kept = 0;
           for (const offer of page.offers) if (keep(entry, offer)) kept += 1;
@@ -1526,7 +1748,7 @@
           // Multi-country page 1 is sorted by raw item price (excluding shipping), so foreign shops
           // can crowd domestic sellers off page 1. Merge domestic offers when cached or crowded.
           if (seedDomestic && !runner.blocked()) {
-            const domKey = ['product', entry.productPath || entry.url, query.language ?? '', domesticKeyPart, query.minCondition].join('|');
+            const domKey = productCacheKey(entry.productPath || entry.url, query.language, domesticKeyPart, query.minCondition, minRep, allowedSellerTypes);
             const rawRows = page.offers.length + (page.skipped || 0);
             const domCount = domesticLocation ? page.offers.filter(o => o.location === domesticLocation).length : 0;
             if (hasFreshCache(domKey) || (rawRows >= domesticPageFullThreshold && domCount < domesticProductMinOffers)) {
@@ -1575,13 +1797,15 @@
               state.groupsSkipped += groups.length - index;
               break;
             }
-            for (const sellerType of splitBySellerType ? SELLER_TYPES : [undefined]) {
+            for (const sellerType of sellerTypeQueries) {
               const query = {
                 language, sellerCountries, minCondition: entry.minCondition, foil: entry.foil, signed: entry.signed, altered: entry.altered,
                 expansions: group.expansions, sellerType,
+                ...(minRep != null ? { sellerReputation: minRep } : {}),
               };
+              const sellerTypeKey = Array.isArray(sellerType) ? sellerType.join('.') : (sellerType ?? '');
               const key = ['card', entry.cardPath, langKey, countriesKey, entry.minCondition, entry.foil, entry.signed, entry.altered,
-                (group.expansions || []).join('.'), sellerType ?? ''].join('|');
+                (group.expansions || []).join('.'), sellerTypeKey].join('|') + repKeySuffix;
               const page = await cached(key, () => call('cardPage', entry, query));
               let kept = 0;
               for (const offer of page.offers) if (keep(entry, offer)) kept += 1;
@@ -1596,7 +1820,7 @@
               // any fresh domestic query cache at zero network cost).
               if (seedDomestic && !runner.blocked()) {
                 const domKey = ['card', entry.cardPath, langKey, domesticKeyPart, entry.minCondition, entry.foil, entry.signed, entry.altered,
-                  (group.expansions || []).join('.'), sellerType ?? ''].join('|');
+                  (group.expansions || []).join('.'), sellerTypeKey].join('|') + repKeySuffix;
                 const rawRows = page.offers.length + (page.skipped || 0);
                 const domCount = domesticLocation ? page.offers.filter(o => o.location === domesticLocation).length : 0;
                 if (hasFreshCache(domKey) || (rawRows >= domesticPageFullThreshold && domCount < domesticMinOffers)) {
@@ -1889,8 +2113,17 @@
                 prevPageLastPrice = page.offers[page.offers.length - 1].priceCents;
               }
 
+              const meta = sellerMeta.get(row.seller);
               for (const offer of page.offers) {
-                const enriched = loc && !offer.location ? { ...offer, seller: row.seller, location: loc } : { ...offer, seller: row.seller };
+                const enriched = {
+                  ...offer,
+                  seller: row.seller,
+                  ...(loc && !offer.location ? { location: loc } : {}),
+                  ...(meta?.rating && offer.rating == null ? { rating: meta.rating } : {}),
+                  ...(meta?.reputation != null && offer.reputation == null ? { reputation: meta.reputation } : {}),
+                  ...(meta?.sellerType != null && offer.sellerType == null ? { sellerType: meta.sellerType } : {}),
+                  ...(meta?.professional != null && offer.professional == null ? { professional: meta.professional } : {}),
+                };
                 const targetsForProduct = byProduct.get(`${listGame}:${offer.idProduct}`) || [];
                 for (const entry of targetsForProduct) {
                   if (entry.listId != null && String(entry.listId) !== String(list.listId)) continue;
@@ -1977,6 +2210,7 @@
     const results = buildResults();
     log({ type: 'run-end', ...stats, blocked: runner.blocked()?.message ?? null });
     return { method: 'sellers', results, sellers, stats, blocked: runner.blocked()?.message ?? null, sellerCountries,
+      sellerFilter: { minReputation: minRep, sellerTypes: allowedSellerTypes },
       rule: { targetCopies, targetSellers, cutoffFactor, cutoffMarginCents, minSellers, sellerBatch, sellerLimit, improvementCents, minSellerCards } };
   }
 
@@ -2185,5 +2419,8 @@
     parseUserOffersPage,
     parseWantsList, parseWantsListName, parseWantsOverview, parseProductPageMeta, parseOfferRow, parseProductOfferRow,
     cents, allCents, RetryableError, BlockedError, StoppedError, LANGUAGES, CONDITIONS, CACHE_MAX_AGE_MS,
+    SELLER_TYPES, SELLER_REPUTATIONS, SELLER_REPUTATION_LABELS, SELLER_TYPE_LABELS,
+    normalizeSellerReputation, normalizeSellerTypes, offerReputationRank, offerSellerType, matchesSellerFilter,
+    queryString, checkFilterEcho, checkOffer,
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

@@ -98,6 +98,36 @@
           <div id="countryCheckboxes" class="country-grid"></div>
         </div>
 
+        <div class="field-row">
+          <label class="field-label" for="minReputation">Min. Seller Reputation (&ge;)</label>
+          <select id="minReputation" class="select">
+            <option value="1">Outstanding</option>
+            <option value="2" selected>Very good</option>
+            <option value="3">Good</option>
+            <option value="4">Average</option>
+            <option value="5">Bad (Any)</option>
+          </select>
+          <div id="minReputationHint" class="field-hint"></div>
+        </div>
+
+        <div class="field-row">
+          <label class="field-label">Seller Type</label>
+          <div id="sellerTypeChecks" class="seller-type-grid">
+            <label class="seller-type-chip">
+              <input type="checkbox" data-seller-type="0" checked>
+              <span>Private</span>
+            </label>
+            <label class="seller-type-chip">
+              <input type="checkbox" data-seller-type="1" checked>
+              <span>Pro</span>
+            </label>
+            <label class="seller-type-chip">
+              <input type="checkbox" data-seller-type="2" checked>
+              <span>Powerseller</span>
+            </label>
+          </div>
+        </div>
+
         <div class="field-grid">
           <div>
             <label class="field-label" for="shipTo">Ship to</label>
@@ -398,6 +428,7 @@
                   <tr>
                     <th>Seller</th>
                     <th>Country</th>
+                    <th>Reputation</th>
                     <th>Games</th>
                     <th>Your items</th>
                     <th>At/below market</th>
