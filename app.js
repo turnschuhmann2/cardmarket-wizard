@@ -6,6 +6,7 @@
 
   const {
     collect, collectBySellers, collectSellerTokens, createRunner, browserSite, BlockedError, RetryableError, RefusedError, CartRejectError, TokenExpiredError, CACHE_MAX_AGE_MS,
+    SELLER_TYPES, SELLER_REPUTATION_LABELS, SELLER_TYPE_LABELS, normalizeSellerReputation, normalizeSellerTypes,
   } = globalThis.CardmarketCollector;
   const {
     parseShippingTable, parcelShipping, scopeKey, filterByLimits, previewLimitLeftOut, matchesScope, summarizeBasketBySource,
@@ -41,7 +42,16 @@
   const THOROUGH = { splitBySellerType: true, groupSkipFactor: 3, minSellers: 80, sellerBatch: 20, sellerLimit: 200, maxSellerPages: 15, improvementCents: 20 };
   const DEFAULT_INTERVAL_MS = 400;
   const VALID_INTERVALS = [400, 600, 1000, 2000];
-  const SETTINGS_VERSION = 2;
+  const DEFAULT_MIN_REPUTATION = 2;
+  const DEFAULT_SELLER_TYPES = [0, 1, 2];
+  const REPUTATION_HINTS = {
+    1: '36+ evaluations, ≥97% very good. Excludes new & unrated sellers.',
+    2: '36+ evaluations, ≥92% very good. Excludes new/unrated & low-rated sellers.',
+    3: '6+ evaluations, ≤4% neutral, ≤2% bad. Excludes new & unrated sellers.',
+    4: 'Excludes Bad and new/unrated sellers (<6 evaluations).',
+    5: 'Unfiltered — includes Bad and brand-new sellers with no rating yet.',
+  };
+  const SETTINGS_VERSION = 3;
   const LIMIT_CANDIDATES = [50, 100, 200, 300, 500, 1000, 2000];
   const TRACKED_MEMORY_MS = 30 * 24 * 60 * 60 * 1000;
   const CART_MEMORY_MS = 12 * 60 * 60 * 1000;
@@ -212,6 +222,8 @@
     extraProducts: [],       // [{ id, idProduct, name, game, category, productPath, url, amount, enabled }]
     regionMode: 'de',        // 'de' | 'eu' | 'custom'
     customCountries: [...NEIGHBOURS],
+    minReputation: DEFAULT_MIN_REPUTATION, // 1=Outstanding, 2=Very good, 3=Good, 4=Average, 5=Bad (Any)
+    sellerTypes: [...DEFAULT_SELLER_TYPES], // subset of [0=Private, 1=Professional, 2=Powerseller]
     shipTo: 7,
     method: 'sellers',
     interval: DEFAULT_INTERVAL_MS,
@@ -421,6 +433,15 @@
     return state.extraProducts.filter(p => p.enabled !== false && (p.amount || 1) > 0);
   }
 
+  function sellerFilterSignaturePart() {
+    const minRep = normalizeSellerReputation(state.minReputation);
+    const types = normalizeSellerTypes(state.sellerTypes);
+    const parts = [];
+    if (minRep != null) parts.push(`r${minRep}`);
+    if (types) parts.push(`t${types.join('.')}`);
+    return parts.length ? `|sf=${parts.join(':')}` : '';
+  }
+
   function selectionSignature() {
     const listsPart = getSelectedListObjects().map(l => `${l.game}:${l.listId}`).sort().join(',');
     const prodsPart = getEnabledProducts().map(p => `${p.productPath}x${p.amount || 1}`).sort().join(',');
@@ -430,11 +451,13 @@
       : countries.length > 1 && countries.includes(state.shipTo)
         ? `${countries.join('.')}:d${state.shipTo}`
         : countries.join('.');
-    return `${listsPart}|${prodsPart}|${regionPart}`;
+    return `${listsPart}|${prodsPart}|${regionPart}${sellerFilterSignaturePart()}`;
   }
 
   // Signatures written before the EU shipping-aware cache format (eu -> eu2:<shipTo>, custom -> ...:d<shipTo>).
+  // Only matched when no seller filter is active so unfiltered legacy caches are never offered under a seller filter.
   function legacySelectionSignatures() {
+    if (sellerFilterSignaturePart()) return [];
     const listsPart = getSelectedListObjects().map(l => `${l.game}:${l.listId}`).sort().join(',');
     const prodsPart = getEnabledProducts().map(p => `${p.productPath}x${p.amount || 1}`).sort().join(',');
     const countries = getSellerCountries();
@@ -459,6 +482,8 @@
         selectedLists: state.selectedLists,
         regionMode: state.regionMode,
         customCountries: state.customCountries,
+        minReputation: state.minReputation,
+        sellerTypes: state.sellerTypes,
         shipTo: state.shipTo,
         method: state.method,
         interval: state.interval,
@@ -783,6 +808,60 @@
         await updateCachePill();
       });
     });
+  }
+
+  function renderSellerFilterControls() {
+    const sel = $('minReputation');
+    if (sel) sel.value = String(state.minReputation);
+    const hint = $('minReputationHint');
+    if (hint) hint.textContent = REPUTATION_HINTS[state.minReputation] || '';
+    const active = new Set(state.sellerTypes);
+    document.querySelectorAll('#sellerTypeChecks input[data-seller-type]').forEach(cb => {
+      cb.checked = active.has(Number(cb.dataset.sellerType));
+    });
+  }
+
+  function renderSellerBadges(meta) {
+    if (!meta) return '';
+    const out = [];
+    const rep = typeof meta.reputation === 'number' ? meta.reputation : null;
+    const ratingKey = meta.rating || (rep === 1 ? 'outstanding' : rep === 2 ? 'very-good' : rep === 3 ? 'good' : rep === 4 ? 'average' : rep === 5 ? 'bad' : null);
+    if (ratingKey) {
+      const labelMap = {
+        outstanding: '★ Outstanding',
+        'very-good': '★ Very good',
+        good: '★ Good',
+        average: 'Average',
+        bad: 'Bad',
+      };
+      const clsMap = {
+        outstanding: 'badge-rep-outstanding',
+        'very-good': 'badge-rep-very-good',
+        good: 'badge-rep-good',
+        average: 'badge-rep-average',
+        bad: 'badge-rep-bad',
+      };
+      if (labelMap[ratingKey]) {
+        out.push(`<span class="badge ${clsMap[ratingKey]}" title="Cardmarket seller reputation">${esc(labelMap[ratingKey])}</span>`);
+      }
+    }
+    if (meta.sellerType === 2) {
+      out.push('<span class="badge badge-seller-power" title="Cardmarket Powerseller">Powerseller</span>');
+    } else if (meta.sellerType === 1 || (meta.sellerType == null && meta.professional === true)) {
+      out.push('<span class="badge badge-seller-pro" title="Professional seller">Pro</span>');
+    } else if (meta.sellerType === 0 || (meta.sellerType == null && meta.professional === false)) {
+      out.push('<span class="badge badge-neutral" title="Private seller">Private</span>');
+    }
+    return out.join(' ');
+  }
+
+  function formatSellerFilterSummary(filter) {
+    if (!filter) return 'Any reputation · All seller types';
+    const minRep = normalizeSellerReputation(filter.minReputation);
+    const types = normalizeSellerTypes(filter.sellerTypes);
+    const repLabel = minRep != null ? `≥ ${SELLER_REPUTATION_LABELS[minRep] || minRep}` : 'Any reputation';
+    const typeLabel = types ? types.map(t => SELLER_TYPE_LABELS[t] || String(t)).join(', ') : 'All seller types';
+    return `${repLabel} · ${typeLabel}`;
   }
 
   function renderSavedRuns() {
@@ -1889,6 +1968,8 @@
       $('parcelsList').innerHTML = b.parcels.map((p, idx) => {
         const badges = [];
         if (p.location) badges.push(`<span class="badge badge-neutral">${esc(p.location)}</span>`);
+        const sellerBadges = renderSellerBadges(p);
+        if (sellerBadges) badges.push(sellerBadges);
         const games = p.games || [];
         if (games.length > 1) badges.push('<span class="badge badge-combo">MTG + YGO combined</span>');
         else if (games[0]) badges.push(`<span class="badge ${games[0] === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${games[0] === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`);
@@ -1995,6 +2076,7 @@
       <tr>
         <td><strong>${esc(row.seller)}</strong></td>
         <td>${esc(row.location || '–')}</td>
+        <td>${renderSellerBadges(row) || '–'}</td>
         <td>${(row.games || []).map(g => `<span class="badge ${g === 'YuGiOh' ? 'badge-ygo' : 'badge-mtg'}">${g === 'YuGiOh' ? 'YGO' : 'MTG'}</span>`).join(' ') || '–'}</td>
         <td class="num"><strong>${row.cards}</strong></td>
         <td class="num">${row.atTarget}</td>
@@ -2016,9 +2098,11 @@
     const mins = ((col.stats.finishedAt - col.stats.startedAt) / 60000).toFixed(1);
     const counts = {};
     for (const r of col.results) counts[r.verdict] = (counts[r.verdict] || 0) + 1;
+    const sellerFilterText = formatSellerFilterSummary(col.sellerFilter);
     $('coverageMeta').innerHTML = `<p class="card-hint">
       Fetched <strong>${esc(new Date(col.stats.finishedAt).toLocaleString())}</strong> (${fmtAge(col.stats.finishedAt)}):
       ${Number(col.stats.requests) || 0} requests (${Number(col.stats.cachedQueries) || 0} cached) in ${mins} min ·
+      Seller filter: <strong>${esc(sellerFilterText)}</strong> ·
       ${Object.entries(counts).map(([k, v]) => `${v} ${esc(k)}`).join(', ')}.
       ${col.blocked ? `<strong style="color:var(--rose)">Stopped early: ${esc(col.blocked)}</strong>` : ''}
     </p>${warningBanner('Warnings:', col.warnings)}`;
@@ -2213,6 +2297,8 @@
       forceFresh,
       method: state.method,
       regionMode: state.regionMode,
+      minReputation: state.minReputation,
+      sellerTypes: state.sellerTypes,
       shipTo: state.shipTo,
       intervalMs: state.interval,
       lists: selectedLists.length,
@@ -2222,7 +2308,7 @@
     let fetchOk = true;
     let fetchError = null;
     let fetchedCol = null;
-    record({ type: 'start', forceFresh, lists: selectedLists, products: enabledProducts.length, sellerCountries, shipTo: state.shipTo });
+    record({ type: 'start', forceFresh, lists: selectedLists, products: enabledProducts.length, sellerCountries, minReputation: state.minReputation, sellerTypes: state.sellerTypes, shipTo: state.shipTo });
 
     try {
       const { collectionRetryAfter: holdUntil } = await chrome.storage.local.get('collectionRetryAfter');
@@ -2320,6 +2406,8 @@
 
       const common = {
         sellerCountries,
+        minReputation: state.minReputation,
+        sellerTypes: state.sellerTypes,
         concurrency: 4,
         intervalMs: state.interval,
         bucketIntervals: { cart: 2000, products: 3000 },
@@ -2457,7 +2545,7 @@
         ? `Your cached offers for this selection are ${fmtAge(info.collection.stats.finishedAt)} (older than 8 hours). Computing will refetch all selected cards and products from Cardmarket so prices and stock are up to date.`
         : info.status === 'incomplete'
           ? `Your cached fetch for this selection stopped early (${fmtAge(info.collection.stats.finishedAt)}). Computing will refetch the remaining cards and products from Cardmarket.`
-          : 'No offer cache exists yet for the selected lists, products, and seller region. Computing will fetch all selected cards and products from Cardmarket first.';
+          : 'No offer cache exists yet for the selected lists, products, seller region, and seller filters. Computing will fetch all selected cards and products from Cardmarket first.';
 
     const modalTitle = info.status === 'legacy'
       ? 'Offer cache uses the older EU format'
@@ -3970,6 +4058,12 @@
     state.selectedLists = s.selectedLists || [];
     state.regionMode = s.regionMode || 'de';
     state.customCountries = Array.isArray(s.customCountries) ? s.customCountries : [...NEIGHBOURS];
+    const savedRep = Number(s.minReputation);
+    state.minReputation = Number.isInteger(savedRep) && savedRep >= 1 && savedRep <= 5 ? savedRep : DEFAULT_MIN_REPUTATION;
+    const savedTypes = Array.isArray(s.sellerTypes)
+      ? [...new Set(s.sellerTypes.map(Number).filter(t => SELLER_TYPES.includes(t)))].sort((a, b) => a - b)
+      : [];
+    state.sellerTypes = savedTypes.length ? savedTypes : [...DEFAULT_SELLER_TYPES];
     state.shipTo = s.shipTo || 7;
     state.method = s.method || 'sellers';
     const savedInterval = Number(s.interval);
@@ -3977,9 +4071,11 @@
       // Upgrade legacy default (1000 ms) and removed 500 ms preset to the new adaptive default,
       // while preserving an explicit Very careful (2000 ms) choice.
       state.interval = savedInterval === 2000 ? 2000 : DEFAULT_INTERVAL_MS;
-      if (data.bwAppSettings) await saveSettings();
     } else {
       state.interval = VALID_INTERVALS.includes(savedInterval) ? savedInterval : DEFAULT_INTERVAL_MS;
+    }
+    if (data.bwAppSettings && (Number(s.settingsVersion) || 0) < SETTINGS_VERSION) {
+      await saveSettings();
     }
 
     $('shipTo').value = state.shipTo;
@@ -4004,6 +4100,7 @@
     renderLists();
     renderProducts();
     renderRegionControls();
+    renderSellerFilterControls();
     renderSavedRuns();
     refreshTokenPreview();
     renderPerfTab();
@@ -4059,6 +4156,32 @@
         const preset = btn.dataset.preset;
         state.customCountries = preset === 'neighbours' ? [...NEIGHBOURS] : preset === 'eu' ? [...EU_IDS] : [];
         renderRegionControls();
+        await saveSettings();
+        await updateCachePill();
+      });
+    });
+
+    $('minReputation').addEventListener('change', async () => {
+      const val = Number($('minReputation').value);
+      state.minReputation = Number.isInteger(val) && val >= 1 && val <= 5 ? val : DEFAULT_MIN_REPUTATION;
+      renderSellerFilterControls();
+      await saveSettings();
+      await updateCachePill();
+    });
+
+    document.querySelectorAll('#sellerTypeChecks input[data-seller-type]').forEach(cb => {
+      cb.addEventListener('change', async () => {
+        const checked = [...document.querySelectorAll('#sellerTypeChecks input[data-seller-type]:checked')]
+          .map(el => Number(el.dataset.sellerType))
+          .filter(t => SELLER_TYPES.includes(t))
+          .sort((a, b) => a - b);
+        if (!checked.length) {
+          cb.checked = true;
+          toast('Select at least one seller type.', 'error');
+          return;
+        }
+        state.sellerTypes = checked;
+        renderSellerFilterControls();
         await saveSettings();
         await updateCachePill();
       });
